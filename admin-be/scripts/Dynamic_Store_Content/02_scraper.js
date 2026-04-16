@@ -1,27 +1,28 @@
 /**
  * STEP 2: Scraper
  *
- * For each store:
- *   1. Scrape homepage (always, cheerio)
- *   2. Discover + try subpages (about, faq, shipping, returns) — cheerio first, Playwright fallback
- *   3. Scrape Trustpilot
- *   4. Query Reddit
+ * Reads merchants_cache.json (produced by 01_fetch.js).
+ * For each merchant:
+ *   1. Scrapes homepage (cheerio)
+ *   2. Discovers + scrapes subpages: about, faq, shipping, returns
+ *   3. Scrapes Trustpilot
+ *   4. Queries Reddit
  *
- * Output: scraped_results.json (only — no DB writes)
- * Hard 15s limit per subpage — never blocks pipeline
- * Reads merchants from local CSV — zero DB reads
- * Saves results after EACH store (crash-safe)
- * Resume-safe — skips already scraped merchants automatically
+ * offerSummary from 01_fetch.js is passed through untouched.
+ * Output: scraped_results.ndjson (newline-delimited JSON for safe incremental writes)
  *
- * Run:             node scripts/Dynamic_Store_Content/02_scraper.js
- * With limit:      node scripts/Dynamic_Store_Content/02_scraper.js --limit=5
- * From ID:         node scripts/Dynamic_Store_Content/02_scraper.js --from-id=100
- * Force re-scrape: node scripts/Dynamic_Store_Content/02_scraper.js --force
- * Force one store: node scripts/Dynamic_Store_Content/02_scraper.js --force-id=123
- * Dry run:         node scripts/Dynamic_Store_Content/02_scraper.js --dry-run
+ * Run:              node scripts/Dynamic_Store_Content/02_scraper.js
+ * Limit:            node scripts/Dynamic_Store_Content/02_scraper.js --limit=5
+ * From ID:          node scripts/Dynamic_Store_Content/02_scraper.js --from-id=100
+ * Single store:     node scripts/Dynamic_Store_Content/02_scraper.js --slug=nike
+ * Force re-scrape:  node scripts/Dynamic_Store_Content/02_scraper.js --force
+ * Concurrency:      node scripts/Dynamic_Store_Content/02_scraper.js --concurrency=3
+ * Dry run:          node scripts/Dynamic_Store_Content/02_scraper.js --dry-run
  */
 
 import pLimit from "p-limit";
+import fs from "fs";
+import path from "path";
 import { discoverUrls } from "./url_discoverer.js";
 import {
   extractContent,
@@ -30,19 +31,20 @@ import {
 } from "./content_extractor.js";
 import { scrapeTrustpilot } from "./trustpilot_scraper.js";
 import { scrapeReddit } from "./reddit_scraper.js";
-import fs from "fs";
-import path from "path";
-import { parse } from "csv-parse/sync";
 
 // ─── Paths ────────────────────────────────────────────────────────────────────
-const CSV_PATH = path.resolve(
-  "./scripts/Dynamic_Store_Content/merchants_cache.csv",
+
+const CACHE_PATH = path.resolve(
+  "./scripts/Dynamic_Store_Content/merchants_cache.json",
 );
+// NDJSON: one JSON record per line — safe for incremental appends,
+// no full-file rewrite on every save (critical at 20k+ stores).
 const SCRAPED_PATH = path.resolve(
-  "./scripts/Dynamic_Store_Content/scraped_results.json",
+  "./scripts/Dynamic_Store_Content/scraped_results.ndjson",
 );
 
 // ─── Args ─────────────────────────────────────────────────────────────────────
+
 const args = process.argv.slice(2);
 const LIMIT = parseInt(
   args.find((a) => a.startsWith("--limit="))?.split("=")[1] || "0",
@@ -50,71 +52,73 @@ const LIMIT = parseInt(
 const FROM_ID = parseInt(
   args.find((a) => a.startsWith("--from-id="))?.split("=")[1] || "0",
 );
-const FORCE_ID = parseInt(
-  args.find((a) => a.startsWith("--force-id="))?.split("=")[1] || "0",
-);
+const SLUG = args.find((a) => a.startsWith("--slug="))?.split("=")[1] || null;
 const DRY_RUN = args.includes("--dry-run");
-const FORCE_ALL = args.includes("--force");
+const FORCE = args.includes("--force");
+const CONCURRENCY = parseInt(
+  args.find((a) => a.startsWith("--concurrency="))?.split("=")[1] || "1",
+);
 
 // ─── Config ───────────────────────────────────────────────────────────────────
-const CONCURRENCY = 1;
-const PAGE_DELAY_MS = 1500; // between subpages on same domain — avoids soft-blocks
+
+const PAGE_DELAY_MS = 1500;
 const SUBPAGE_TIMEOUT = 15000;
 
 // ─── Resume support ───────────────────────────────────────────────────────────
-let scrapedResults = [];
-if (fs.existsSync(SCRAPED_PATH)) {
+// Reads existing NDJSON to build the already-scraped slug set.
+// Never loads all records into memory — just slug index.
+
+function loadScrapedSlugs() {
+  const slugs = new Set();
+  if (!fs.existsSync(SCRAPED_PATH)) return slugs;
   try {
-    const raw = fs.readFileSync(SCRAPED_PATH, "utf8").trim();
-    if (raw && raw !== "[]") {
-      scrapedResults = JSON.parse(raw);
-      console.log(`📋 Resuming — ${scrapedResults.length} already scraped`);
-    } else {
-      console.log("📋 scraped_results.json empty, starting fresh");
+    const lines = fs.readFileSync(SCRAPED_PATH, "utf8").split("\n");
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      try {
+        const rec = JSON.parse(trimmed);
+        if (rec.slug) slugs.add(rec.slug);
+      } catch {}
     }
+    console.log(`📋 Resuming — ${slugs.size} already scraped`);
   } catch (err) {
-    console.log(
-      `⚠️  Invalid scraped_results.json, starting fresh: ${err.message}`,
-    );
-    scrapedResults = [];
+    console.log(`⚠️  Could not read scraped_results.ndjson: ${err.message}`);
   }
+  return slugs;
 }
 
-// Build skip set — honour --force-id and --force-all
-const alreadyScraped = new Set(
-  FORCE_ALL
-    ? []
-    : scrapedResults
-        .filter((r) =>
-          FORCE_ID ? r.id?.toString() !== FORCE_ID.toString() : true,
-        )
-        .map((r) => r.id?.toString()),
-);
-
-function saveProgress() {
-  fs.writeFileSync(SCRAPED_PATH, JSON.stringify(scrapedResults, null, 2));
+// Append a single record as one line — O(1), no full-file rewrite.
+function appendRecord(record) {
+  fs.appendFileSync(SCRAPED_PATH, JSON.stringify(record) + "\n");
 }
 
-// ─── category_names parser ────────────────────────────────────────────────────
-// CSV stores category_names as a Python-style list string e.g. "['Clothing', 'Apparel']"
-// or a JSON array string. Normalise to a plain comma-separated string for the generator.
-function parseCategoryNames(raw) {
-  if (!raw || typeof raw !== "string") return "";
-  const trimmed = raw.trim();
-  // Already a clean string
-  if (!trimmed.startsWith("[")) return trimmed;
-  try {
-    // Try JSON parse first (double-quoted array)
-    const arr = JSON.parse(trimmed);
-    if (Array.isArray(arr)) return arr.join(", ");
-  } catch (_) {}
-  // Python-style single-quoted list: ['Clothing', 'Apparel']
-  const matches = trimmed.match(/'([^']+)'/g);
-  if (matches) return matches.map((s) => s.replace(/'/g, "")).join(", ");
-  return trimmed;
+// For --force: rewrite only the affected slug's line is complex with NDJSON,
+// so on --force we rewrite the whole file. Acceptable — force is a deliberate
+// operator action, not the hot path.
+function rewriteNdjson(records) {
+  fs.writeFileSync(
+    SCRAPED_PATH,
+    records.map((r) => JSON.stringify(r)).join("\n") + "\n",
+  );
+}
+
+function loadAllRecords() {
+  if (!fs.existsSync(SCRAPED_PATH)) return [];
+  const lines = fs.readFileSync(SCRAPED_PATH, "utf8").split("\n");
+  const records = [];
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      records.push(JSON.parse(trimmed));
+    } catch {}
+  }
+  return records;
 }
 
 // ─── Trustpilot snippet cleaner ───────────────────────────────────────────────
+
 function cleanTrustpilotSnippets(snippets = []) {
   if (!Array.isArray(snippets)) return [];
   const banned = [
@@ -134,6 +138,7 @@ function cleanTrustpilotSnippets(snippets = []) {
 }
 
 // ─── Reddit cleaner ───────────────────────────────────────────────────────────
+
 function cleanRedditData(reddit = {}, storeName = "") {
   if (!reddit || typeof reddit !== "object") {
     return {
@@ -145,18 +150,20 @@ function cleanRedditData(reddit = {}, storeName = "") {
     };
   }
 
-  const brand = (storeName || "").toLowerCase();
-  const offTopicSubs = [
+  const brand = storeName.toLowerCase();
+  const offTopicSubs = new Set([
     "destinythegame",
     "superstonk",
     "politics",
     "gaming",
     "pcgaming",
-    "costaricatravel",
     "wallstreetbets",
     "nfl",
     "nba",
-  ];
+    "soccer",
+    "movies",
+    "television",
+  ]);
   const shoppingKeywords = [
     "coupon",
     "code",
@@ -178,13 +185,13 @@ function cleanRedditData(reddit = {}, storeName = "") {
     "service",
   ];
 
-  const filteredThreads = (reddit.threads || []).filter((t) => {
+  const filtered = (reddit.threads || []).filter((t) => {
     if (!t || typeof t !== "object") return false;
     const title = (t.title || "").toLowerCase();
     const snip = (t.snippet || "").toLowerCase();
     const sub = (t.subreddit || "").toLowerCase();
 
-    if (offTopicSubs.includes(sub)) return false;
+    if (offTopicSubs.has(sub)) return false;
 
     const hasBrand =
       brand.length > 3 && (title.includes(brand) || snip.includes(brand));
@@ -192,18 +199,12 @@ function cleanRedditData(reddit = {}, storeName = "") {
       (k) => title.includes(k) || snip.includes(k),
     );
 
-    // Brand mention alone is sufficient. Keyword alone is not — too noisy.
-    return (
-      hasBrand ||
-      (hasKeyword &&
-        (title.includes(brand.split(" ")[0]) ||
-          snip.includes(brand.split(" ")[0])))
-    );
+    return hasBrand || (hasKeyword && title.includes(brand.split(" ")[0]));
   });
 
   return {
-    found: filteredThreads.length > 0, // only true if threads survived filter
-    threads: filteredThreads.slice(0, 6),
+    found: filtered.length > 0,
+    threads: filtered.slice(0, 6),
     commonQuestions: Array.isArray(reddit.commonQuestions)
       ? reddit.commonQuestions
       : [],
@@ -214,21 +215,21 @@ function cleanRedditData(reddit = {}, storeName = "") {
   };
 }
 
-// ─── Scoring ──────────────────────────────────────────────────────────────────
-// Graduated scoring — more data = meaningfully higher score, not just binary flags
-function scoreRichness(data) {
+// ─── Richness scoring ─────────────────────────────────────────────────────────
+
+function scoreRichness(data, offerSummary) {
   let s = 0;
   const w = data.website || {};
   const hp = w.homepage || {};
   const tp = data.trustpilot || {};
   const rd = data.reddit || {};
 
-  // Homepage signals
   if (hp.h1) s += 4;
   if ((hp.metaDescription || "").length > 50) s += 6;
   if (hp.heroTaglines?.length) s += Math.min(hp.heroTaglines.length, 4) * 1.5;
-  s += Math.min(hp.productHeadings?.length || 0, 10) * 0.8; // up to 8pts
-  s += Math.min(hp.keyParagraphs?.length || 0, 6) * 1.5; // up to 9pts
+  if (hp.productHeadings?.length)
+    s += Math.min(hp.productHeadings.length, 10) * 0.8;
+  if (hp.keyParagraphs?.length) s += Math.min(hp.keyParagraphs.length, 6) * 1.5;
   if (hp.customerReviews?.length) s += Math.min(hp.customerReviews.length, 5);
   if (hp.trustSignals?.returnWindow) s += 4;
   if (hp.trustSignals?.freeShippingThreshold) s += 4;
@@ -240,40 +241,49 @@ function scoreRichness(data) {
   if (hp.specialOffers?.referralProgram) s += 1;
   if (hp.salePatterns?.length) s += Math.min(hp.salePatterns.length, 3);
 
-  // Subpage signals
   if (w.about?.keyParagraphs?.length)
     s += Math.min(w.about.keyParagraphs.length, 4) * 2;
   if (w.about?.foundingStory) s += 4;
+  if (w.about?.mission) s += 3;
   if (w.about?.stats?.length) s += Math.min(w.about.stats.length, 3);
-  if (w.faq?.faqs?.length >= 2) s += Math.min(w.faq.faqs.length, 8) * 1.2;
-  if (w.shipping?.freeShippingThreshold) s += 4;
-  if (w.returns?.returnWindow) s += 4;
+  if (w.faq?.faqs?.length) s += Math.min(w.faq.faqs.length, 8) * 1.5;
+  if (w.shipping?.freeShippingThreshold) s += 5;
+  if (w.shipping?.deliveryTimes?.length) s += 3;
+  if (w.returns?.returnWindow) s += 5;
+  if (w.returns?.freeReturns) s += 3;
 
-  // Third-party signals
   if (tp.found) s += 8;
-  if (tp.rating) s += 3;
-  if (tp.snippets?.length >= 2) s += Math.min(tp.snippets.length, 5);
-  if (tp.commonPraise?.length) s += 2;
-  if (tp.commonComplaints?.length) s += 1; // complaints = real data
+  if (tp.rating >= 4.0) s += 4;
+  if ((tp.reviewCount || 0) >= 100) s += 3;
+  if (tp.snippets?.length) s += Math.min(tp.snippets.length, 4);
+  if (tp.commonComplaints?.length) s += 1;
+
   if (rd.found) s += 5;
   if (rd.commonQuestions?.length) s += Math.min(rd.commonQuestions.length, 3);
-  if (rd.threads?.length >= 2) s += 2;
+  if ((rd.threads?.length || 0) >= 2) s += 2;
+
+  if ((offerSummary?.totalActive || 0) > 0) s += 6;
+  if ((offerSummary?.verifiedCount || 0) > 0) s += 4;
+  if (offerSummary?.bestDiscount) s += 3;
+  if ((offerSummary?.topCodes?.length || 0) > 0) s += 3;
 
   return Math.min(Math.round(s), 100);
 }
 
-function assignTier(score, couponCount, hasWebUrl) {
+function assignTier(score, offerSummary, hasWebUrl) {
   if (!hasWebUrl) return "D";
-  // High coupons lower the score bar for Tier A — monetisation priority
+  const couponCount = offerSummary?.totalActive || 0;
   const couponBoost = couponCount >= 10 ? 10 : couponCount >= 5 ? 5 : 0;
-  const effectiveScore = score + couponBoost;
-  if (effectiveScore >= 55 && couponCount > 0) return "A";
-  if (effectiveScore >= 30) return "B";
-  if (effectiveScore >= 10) return "C";
+  const verifiedBoost = (offerSummary?.verifiedCount || 0) >= 3 ? 5 : 0;
+  const effective = score + couponBoost + verifiedBoost;
+  if (effective >= 55 && couponCount > 0) return "A";
+  if (effective >= 30) return "B";
+  if (effective >= 10) return "C";
   return "D";
 }
 
-// ─── Safe subpage fetch with AbortController (actually cancels on timeout) ───
+// ─── Safe subpage fetch ───────────────────────────────────────────────────────
+
 async function tryFetchSubpage(url, category) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), SUBPAGE_TIMEOUT);
@@ -289,6 +299,7 @@ async function tryFetchSubpage(url, category) {
 }
 
 // ─── Scrape one merchant ──────────────────────────────────────────────────────
+
 async function scrapeMerchant(merchant) {
   const base = merchant.web_url?.replace(/\/$/, "");
   if (!base) return { score: 0, tier: "D", data: null };
@@ -313,18 +324,19 @@ async function scrapeMerchant(merchant) {
   for (const category of ["about", "faq", "shipping", "returns"]) {
     const urls = discovery.classified[category] || [];
     if (!urls.length) continue;
+
     for (const { url } of urls) {
+      await new Promise((r) => setTimeout(r, PAGE_DELAY_MS));
       const content = await tryFetchSubpage(url, category);
       if (hasUsefulContent(content)) {
         scraped.website[category] = content;
         if (content.usedPlaywright) console.log(`      ↳ Playwright: ${url}`);
         break;
       }
-      await new Promise((r) => setTimeout(r, PAGE_DELAY_MS));
     }
   }
 
-  let tp = await scrapeTrustpilot(base);
+  const tp = await scrapeTrustpilot(base);
   scraped.trustpilot = {
     ...(tp || {}),
     snippets: cleanTrustpilotSnippets(tp?.snippets),
@@ -335,14 +347,14 @@ async function scrapeMerchant(merchant) {
   const rd = await scrapeReddit(merchant.name, base);
   scraped.reddit = cleanRedditData(rd, merchant.name);
 
-  const couponCount = parseInt(merchant.active_coupons_count) || 0;
-  const score = scoreRichness(scraped);
-  const tier = assignTier(score, couponCount, !!base);
+  const score = scoreRichness(scraped, merchant.offerSummary);
+  const tier = assignTier(score, merchant.offerSummary, !!base);
 
   return { score, tier, data: scraped };
 }
 
 // ─── Summary ──────────────────────────────────────────────────────────────────
+
 function printSummary(results) {
   const ok = results.filter((r) => !r.error);
   const errored = results.filter((r) => r.error);
@@ -365,7 +377,7 @@ function printSummary(results) {
     `🏁 Scrape complete — ${ok.length} ok | ${errored.length} errors`,
   );
   console.log(
-    `   Tiers:   A=${tiers.A}  B=${tiers.B}  C=${tiers.C}  D=${tiers.D}`,
+    `   Tiers:        A=${tiers.A}  B=${tiers.B}  C=${tiers.C}  D=${tiers.D}`,
   );
   console.log(
     `   Avg score:    ${ok.length ? Math.round(totalScore / ok.length) : 0}`,
@@ -378,53 +390,58 @@ function printSummary(results) {
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
-async function main() {
-  console.log(
-    `🔍 Scraper | Concurrency: ${CONCURRENCY} | Limit: ${LIMIT || "all"} | DryRun: ${DRY_RUN}\n`,
-  );
 
-  if (!fs.existsSync(CSV_PATH)) {
-    console.error(`❌ CSV not found: ${CSV_PATH}`);
+async function main() {
+  if (!fs.existsSync(CACHE_PATH)) {
+    console.error(
+      `❌ merchants_cache.json not found. Run 01_fetch.js first.\n   Expected: ${CACHE_PATH}`,
+    );
     process.exit(1);
   }
 
-  const raw = parse(fs.readFileSync(CSV_PATH, "utf8"), {
-    columns: true,
-    skip_empty_lines: true,
-    trim: true,
-  });
-  console.log(`📁 CSV loaded: ${raw.length} rows`);
-
-  const ALL_MERCHANTS = raw.filter((m) => {
-    const isPublish = (m.is_publish || "").toString().trim().toLowerCase();
-    const status = (m.content_status || "").toString().trim().toLowerCase();
-    // Exclude noindex (Tier D — no web_url, scraping them is pointless)
-    // Exclude scrape_failed unless --force is passed
-    const validStatuses = FORCE_ALL
-      ? ["template", "failed", "scraped", "scrape_failed"]
-      : ["template", "failed"];
-    return isPublish === "true" && validStatuses.includes(status);
-  });
-  console.log(`📋 Eligible merchants: ${ALL_MERCHANTS.length}`);
-
-  let merchants = ALL_MERCHANTS.filter(
-    (m) => !alreadyScraped.has(m.id?.toString()),
+  const allMerchants = JSON.parse(fs.readFileSync(CACHE_PATH, "utf8"));
+  console.log(
+    `\n🔍 Scraper | Concurrency: ${CONCURRENCY} | Limit: ${LIMIT || "all"} | DryRun: ${DRY_RUN}\n`,
   );
-  if (FROM_ID) merchants = merchants.filter((m) => parseInt(m.id) >= FROM_ID);
-  if (FORCE_ID)
-    merchants = ALL_MERCHANTS.filter((m) => parseInt(m.id) === FORCE_ID);
+  console.log(`📁 Cache loaded: ${allMerchants.length} merchants`);
+
+  const alreadyScrapedSlugs = FORCE ? new Set() : loadScrapedSlugs();
+
+  let merchants = allMerchants.filter((m) => {
+    if (!m.web_url) return false;
+    if (SLUG) return m.slug === SLUG;
+    if (alreadyScrapedSlugs.has(m.slug)) return false;
+    return true;
+  });
+
+  if (FROM_ID) merchants = merchants.filter((m) => m.id >= FROM_ID);
   if (LIMIT) merchants = merchants.slice(0, LIMIT);
 
   console.log(
-    `📦 To scrape: ${merchants.length} | Already done: ${alreadyScraped.size}\n`,
+    `📦 To scrape: ${merchants.length} | Already done: ${alreadyScrapedSlugs.size}\n`,
   );
 
   if (!merchants.length) {
     console.log(
-      "✅ Nothing to scrape. Use --force to re-scrape all or --force-id=N for one store.",
+      "✅ Nothing to scrape. Use --force to re-scrape all, or --slug=X for one store.",
     );
     return;
   }
+
+  if (DRY_RUN) {
+    console.log("[DRY RUN] Would scrape:");
+    for (const m of merchants.slice(0, 10)) {
+      console.log(
+        `  ${m.name} (${m.web_url}) — offers: ${m.offerSummary?.totalActive || 0}`,
+      );
+    }
+    if (merchants.length > 10)
+      console.log(`  ... and ${merchants.length - 10} more`);
+    return;
+  }
+
+  // On --force, load all existing records so we can rewrite with updates
+  let existingRecords = FORCE ? loadAllRecords() : null;
 
   const limiter = pLimit(CONCURRENCY);
   const sessionResults = [];
@@ -432,7 +449,10 @@ async function main() {
   await Promise.all(
     merchants.map((m) =>
       limiter(async () => {
-        console.log(`  ↳ ${m.name} (${m.web_url})`);
+        console.log(
+          `  ↳ [${m.offerSummary?.totalActive || 0} offers] ${m.name} (${m.web_url})`,
+        );
+
         try {
           const { score, tier, data } = await scrapeMerchant(m);
 
@@ -445,6 +465,7 @@ async function main() {
           const faqStr = data?.website?.faq?.faqs?.length
             ? `FAQs:${data.website.faq.faqs.length}`
             : "no-faq";
+
           console.log(
             `    ✓ Tier:${tier} Score:${score} | ${faqStr} | ${tpStr} | ${rdStr}`,
           );
@@ -455,41 +476,45 @@ async function main() {
             slug: m.slug,
             web_url: m.web_url,
             active_coupons_count: m.active_coupons_count,
-            category_names: parseCategoryNames(m.category_names), // normalised string
+            category_names: m.category_names,
+            offerSummary: m.offerSummary,
             tier,
             score,
             scraped_data: data,
             scraped_at: new Date().toISOString(),
           };
 
-          if (!DRY_RUN) {
-            // If force-rescraping, replace existing record
-            if (FORCE_ID || FORCE_ALL) {
-              const idx = scrapedResults.findIndex(
-                (r) => r.id?.toString() === m.id?.toString(),
-              );
-              if (idx >= 0) scrapedResults[idx] = record;
-              else scrapedResults.push(record);
-            } else {
-              scrapedResults.push(record);
-            }
-            saveProgress();
+          if (FORCE) {
+            const idx = existingRecords.findIndex((r) => r.slug === m.slug);
+            if (idx >= 0) existingRecords[idx] = record;
+            else existingRecords.push(record);
+            rewriteNdjson(existingRecords);
+          } else {
+            appendRecord(record); // O(1) — no full file rewrite
           }
+
           sessionResults.push(record);
         } catch (err) {
           console.error(`    ✗ ${m.name}: ${err.message}`);
           const errRecord = {
             id: m.id,
             name: m.name,
+            slug: m.slug,
             tier: "D",
             score: 0,
             error: err.message.substring(0, 500),
             scraped_at: new Date().toISOString(),
           };
-          if (!DRY_RUN) {
-            scrapedResults.push(errRecord);
-            saveProgress();
+
+          if (FORCE) {
+            const idx = existingRecords.findIndex((r) => r.slug === m.slug);
+            if (idx >= 0) existingRecords[idx] = errRecord;
+            else existingRecords.push(errRecord);
+            rewriteNdjson(existingRecords);
+          } else {
+            appendRecord(errRecord);
           }
+
           sessionResults.push(errRecord);
         }
       }),
