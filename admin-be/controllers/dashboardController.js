@@ -1,33 +1,16 @@
 // controllers/dashboardController.js
-import * as merchantRepo from "../dbhelper/MerchantRepo.js";
-import * as couponRepo from "../dbhelper/CouponsRepo.js";
-import * as blogRepo from "../dbhelper/BlogRepo.js";
+import {supabase} from "../dbhelper/dbclient.js";
 
 export async function getSummary(req, res) {
   try {
-    const [stores, coupons, blogs] = await Promise.all([
-      merchantRepo.count(),
-      couponRepo.countTopCoupons(),
-      blogRepo.countPublished(),
-    ]);
+    const { data, error } = await supabase.rpc("get_dashboard_summary");
+    if (error) throwSupabaseError(error, "getSummary");
 
-    return res.json({
-      data: {
-        totalStores: stores,
-        topCoupons: coupons,
-        publishedBlogs: blogs,
-      },
-      error: null,
-    });
+    return res.json({ data, error: null });
   } catch (err) {
     console.error("Dashboard summary error:", err);
-    return res.status(500).json({
-      data: null,
-      error: {
-        message:
-          err.message || err?.details || "Error fetching dashboard summary",
-        details: err,
-      },
-    });
+    return res
+      .status(500)
+      .json({ data: null, error: { message: err.message } });
   }
 }
