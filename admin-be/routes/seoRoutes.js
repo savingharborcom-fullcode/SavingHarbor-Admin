@@ -93,3 +93,5 @@ router.get("/merchant-data", async (req, res) => {
     res.status(500).json({ error: "Internal error" });
   }
 });
+
+export default router;
