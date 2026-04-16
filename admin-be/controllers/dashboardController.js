@@ -1,6 +1,6 @@
 // controllers/dashboardController.js
 import {supabase} from "../dbhelper/dbclient.js";
-
+import {throwSupabaseError} from "../utils/supabaseError.js";
 export async function getSummary(req, res) {
   try {
     const { data, error } = await supabase.rpc("get_dashboard_summary");
