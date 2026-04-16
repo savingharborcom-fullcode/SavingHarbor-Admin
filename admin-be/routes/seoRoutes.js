@@ -10,6 +10,9 @@
  * ─────────────────────────────────────────────────────────────────
  *
  */
+import express from "express";
+
+const router = express.Router();
 
 // routes/seo.js
 router.get("/merchant-data", async (req, res) => {
