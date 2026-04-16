@@ -170,6 +170,6 @@ export async function countPublished() {
     .select("*", { count: "exact", head: true })
     .eq("is_publish", true);
 
-  if (error) throw error;
+  if (error) throwSupabaseError(error, "BlogRepo.countPublished");
   return count ?? 0;
 }

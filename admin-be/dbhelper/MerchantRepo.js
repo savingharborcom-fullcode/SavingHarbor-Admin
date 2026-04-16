@@ -1,4 +1,5 @@
 import { supabase } from "../dbhelper/dbclient.js";
+import { throwSupabaseError } from "../utils/supabaseError.js";
 
 // Normalize slug
 const toSlug = (s) =>
@@ -173,9 +174,9 @@ export async function insert(payload) {
 // Update (drops undefined keys)
 export async function update(id, patch) {
   const clean = Object.fromEntries(
-    Object.entries(patch).filter(([, v]) => v !== undefined)
+    Object.entries(patch).filter(([, v]) => v !== undefined),
   );
-  
+
   if (Object.keys(clean).length === 0) {
     return await getById(id);
   }
@@ -220,6 +221,6 @@ export async function count() {
     .from("merchants")
     .select("*", { count: "exact", head: true });
 
-  if (error) throw error;
+  if (error) throwSupabaseError(error, "MerchantRepo.count");
   return count ?? 0;
 }

@@ -168,7 +168,7 @@ export async function countTopCoupons() {
     .select("*", { count: "exact", head: true })
     .eq("is_publish", true);
 
-  if (error) throw error;
+  if (error) throwSupabaseError(error, "CouponsRepo.countTopCoupons");
   return count ?? 0;
 }
 
