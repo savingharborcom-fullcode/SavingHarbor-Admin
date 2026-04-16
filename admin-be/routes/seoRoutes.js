@@ -44,7 +44,7 @@ router.get("/merchant-data", async (req, res) => {
     const { data: merchantCategory } = await supabase
       .from("merchant_categories")
       .select("id, name ")
-      .eq("slug", slug)
+      .eq("id", merchant.category_id)
       .single();
 
     const activeCoupons = coupons || [];
