@@ -11,6 +11,7 @@
  *
  */
 import express from "express";
+import {supabase} from "../dbhelper/dbclient.js";
 
 const router = express.Router();
 

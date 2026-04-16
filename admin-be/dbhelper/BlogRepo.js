@@ -1,4 +1,5 @@
 import { supabase } from "../dbhelper/dbclient.js";
+import { throwSupabaseError } from "../utils/supabaseError.js";
 
 // ===== List with optional title filter =====
 export async function list({ title }) {

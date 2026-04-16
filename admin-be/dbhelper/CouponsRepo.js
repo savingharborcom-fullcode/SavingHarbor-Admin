@@ -1,6 +1,7 @@
 // src/dbhelper/CouponsRepo.js
 import { supabase } from "./dbclient.js";
 import { deleteFilesByUrls } from "../services/deleteFilesByUrl.js";
+import { throwSupabaseError } from "../utils/supabaseError.js";
 
 function toInt(v) {
   const n = Number(v);
