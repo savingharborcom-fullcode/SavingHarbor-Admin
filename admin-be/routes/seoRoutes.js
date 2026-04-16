@@ -42,7 +42,7 @@ router.get("/merchant-data", async (req, res) => {
       .limit(20);
 
     const { data: merchantCategory } = await supabase
-      .from("merchant_categories")
+      .from("merchant_categories_v2")
       .select("id, name ")
       .eq("id", merchant.category_id)
       .single();

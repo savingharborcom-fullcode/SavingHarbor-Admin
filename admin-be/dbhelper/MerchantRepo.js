@@ -219,7 +219,7 @@ export async function remove(id) {
 export async function count() {
   const { count, error } = await supabase
     .from("merchants")
-    .select("*", { count: "exact", head: true });
+    .select("id", { count: "exact", head: true });
 
   if (error) throwSupabaseError(error, "MerchantRepo.count");
   return count ?? 0;
