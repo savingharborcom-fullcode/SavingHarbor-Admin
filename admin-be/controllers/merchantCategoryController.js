@@ -34,8 +34,15 @@ export async function listCategories(req, res) {
     const limit = Math.min(100, Math.max(1, toInt(req.query?.limit || 20, 20)));
     const includeStoreCount = req.query?.include_store_count === "true";
 
+    // parent_id: "null" → root only; numeric string → subcategories; absent → all
+    let parent_id = undefined;
+    if (req.query.parent_id !== undefined) {
+      parent_id = req.query.parent_id === "null" ? null : req.query.parent_id;
+    }
+
     const filter = {
       name,
+      parent_id,
       show_home:
         req.query?.show_home !== undefined
           ? toBool(req.query.show_home)
@@ -56,7 +63,6 @@ export async function listCategories(req, res) {
 
     const { rows, total } = await mcRepo.list({ ...filter, page, limit });
 
-    // Optionally decorate rows with store_count (N+1; acceptable for admin pages)
     let enriched = rows;
     if (includeStoreCount && Array.isArray(rows) && rows.length) {
       enriched = await Promise.all(
@@ -66,30 +72,21 @@ export async function listCategories(req, res) {
             .from("merchants")
             .select("id", { count: "exact", head: true })
             .contains("category_names", [r.name]);
-          if (error) {
-            console.error(
-              "store_count failed for category",
-              r.id,
-              error?.message || error
-            );
-            return { ...r, store_count: 0 };
-          }
+          if (error) return { ...r, store_count: 0 };
           return { ...r, store_count: count || 0 };
-        })
+        }),
       );
     }
 
     return res.json({ data: { rows: enriched, total }, error: null });
   } catch (err) {
-    return res
-      .status(500)
-      .json({
-        data: null,
-        error: {
-          message: "Error listing categories",
-          details: err?.message || err,
-        },
-      });
+    return res.status(500).json({
+      data: null,
+      error: {
+        message: "Error listing categories",
+        details: err?.message || err,
+      },
+    });
   }
 }
 
@@ -149,7 +146,7 @@ export async function createCategory(req, res) {
         FOLDER,
         thumbFile.buffer,
         thumbFile.originalname,
-        thumbFile.mimetype
+        thumbFile.mimetype,
       );
       if (error)
         return res.status(500).json({
@@ -166,7 +163,7 @@ export async function createCategory(req, res) {
         FOLDER,
         topFile.buffer,
         topFile.originalname,
-        topFile.mimetype
+        topFile.mimetype,
       );
       if (error)
         return res.status(500).json({
@@ -183,7 +180,7 @@ export async function createCategory(req, res) {
         FOLDER,
         sideFile.buffer,
         sideFile.originalname,
-        sideFile.mimetype
+        sideFile.mimetype,
       );
       if (error)
         return res.status(500).json({
@@ -283,7 +280,7 @@ export async function updateCategory(req, res) {
         FOLDER,
         thumbFile.buffer,
         thumbFile.originalname,
-        thumbFile.mimetype
+        thumbFile.mimetype,
       );
       if (error)
         return res.status(500).json({
@@ -301,7 +298,7 @@ export async function updateCategory(req, res) {
         FOLDER,
         topFile.buffer,
         topFile.originalname,
-        topFile.mimetype
+        topFile.mimetype,
       );
       if (error)
         return res.status(500).json({
@@ -319,7 +316,7 @@ export async function updateCategory(req, res) {
         FOLDER,
         sideFile.buffer,
         sideFile.originalname,
-        sideFile.mimetype
+        sideFile.mimetype,
       );
       if (error)
         return res.status(500).json({
@@ -339,7 +336,7 @@ export async function updateCategory(req, res) {
       } catch (fileErr) {
         console.error(
           "Category file cleanup (update) failed:",
-          fileErr?.message || fileErr
+          fileErr?.message || fileErr,
         );
       }
     }
@@ -383,14 +380,14 @@ export async function deleteCategory(req, res) {
         .json({ data: null, error: { message: "Category not found" } });
 
     const urls = [c.thumb_url, c.top_banner_url, c.side_banner_url].filter(
-      Boolean
+      Boolean,
     );
     try {
       if (urls.length) await deleteFilesByUrls(BUCKET, urls);
     } catch (fileErr) {
       console.error(
         "Category file deletion failed:",
-        fileErr?.message || fileErr
+        fileErr?.message || fileErr,
       );
       // choose to proceed; change policy if strict consistency required
     }
