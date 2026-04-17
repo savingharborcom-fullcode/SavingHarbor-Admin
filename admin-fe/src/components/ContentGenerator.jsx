@@ -16,7 +16,7 @@
 import { useState, useRef } from "react";
 
 // ─── CONFIG ───────────────────────────────────────────────────────
-const BACKEND_URL = "https://your-app.onrender.com"; // ← CHANGE THIS TO YOUR ACTUAL RENDER URL
+const BACKEND_URL = "https://admin-api.savingharbor.com"; // ← CHANGE THIS TO YOUR ACTUAL RENDER URL
 
 // ─── REAL-TIME CRAWLER (NEW in v2.1) ───────────────────────────────
 const crawlMerchantSite = async (url) => {
@@ -1104,7 +1104,7 @@ export default function VariationEngine() {
   // Your original states + new crawlStatus
   const [apiKey, setApiKey] = useState("");
   const [backendUrl, setBackendUrl] = useState(BACKEND_URL);
-  const [model, setModel] = useState("gemini-2.0-flash"); // v2.1 default
+  const [model, setModel] = useState("gemini-2.5-flash-lite"); // v2.1 default
   const [useDB, setUseDB] = useState(true);
 
   const [merchant, setMerchant] = useState("");
