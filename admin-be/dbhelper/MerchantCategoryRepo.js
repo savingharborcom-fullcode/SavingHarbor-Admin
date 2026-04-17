@@ -75,14 +75,14 @@ export async function list({
   };
 
   let countQ = supabase
-    .from("merchant_categories")
+    .from("merchant_categories_v2")
     .select("id", { count: "exact", head: true });
   countQ = applyFilters(countQ);
   const { count, error: countErr } = await countQ;
   if (countErr) throw countErr;
 
   let q = supabase
-    .from("merchant_categories")
+    .from("merchant_categories_v2")
     .select(selectCols)
     .order("name", { ascending: true })
     .range(from, to);
