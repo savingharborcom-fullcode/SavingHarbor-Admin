@@ -98,4 +98,61 @@ router.get("/merchant-data", async (req, res) => {
   }
 });
 
+// Columns this endpoint is allowed to write — whitelist, nothing else touches the merchants row
+const ALLOWED_CONTENT_FIELDS = new Set([
+  "meta_title",
+  "meta_description",
+  "h1keyword",
+  "meta_keywords",
+  "description_html",
+  "faqs",
+  "coupon_h2_blocks",
+  "coupon_h3_blocks",
+]);
+ 
+router.patch("/merchant-content", async (req, res) => {
+  const { slug, content } = req.body;
+ 
+  if (!slug) return res.status(400).json({ error: "slug is required" });
+  if (!content || typeof content !== "object") return res.status(400).json({ error: "content object is required" });
+ 
+  // Strip any keys not in the whitelist — never let this endpoint touch operational columns
+  const payload = {};
+  for (const [key, value] of Object.entries(content)) {
+    if (ALLOWED_CONTENT_FIELDS.has(key)) {
+      payload[key] = value;
+    }
+  }
+ 
+  if (Object.keys(payload).length === 0) {
+    return res.status(400).json({ error: "No valid content fields provided" });
+  }
+ 
+  // updated_at is handled by the DB trigger (trg_merchants_updated_at), no need to set it manually
+ 
+  try {
+    const { data, error } = await supabase
+      .from("merchants")
+      .update(payload)
+      .eq("slug", slug)
+      .select("id, slug, name, updated_at")
+      .single();
+ 
+    if (error) throw error;
+    if (!data) return res.status(404).json({ error: `No merchant found with slug: ${slug}` });
+ 
+    return res.json({
+      success: true,
+      merchantId: data.id,
+      slug: data.slug,
+      name: data.name,
+      updatedAt: data.updated_at,
+      fieldsUpdated: Object.keys(payload),
+    });
+  } catch (err) {
+    console.error("merchant-content save error:", err);
+    return res.status(500).json({ error: err.message || "Internal error" });
+  }
+});
+ 
 export default router;
