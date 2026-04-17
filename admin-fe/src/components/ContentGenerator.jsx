@@ -1500,6 +1500,9 @@ export default function VariationEngine() {
               style={{ ...inputStyle, height: 36 }}
               disabled={running}
             >
+              <option value="gemini-2.5-flash-lite">
+                gemini-2.5-flash-lite (most affordable)
+              </option>
               <option value="gemini-1.5-pro">
                 gemini-1.5-pro (best quality)
               </option>
