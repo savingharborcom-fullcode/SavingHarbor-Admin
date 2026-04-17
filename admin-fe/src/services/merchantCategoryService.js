@@ -105,28 +105,53 @@ export async function removeMerchantCategory(id) {
   }
 }
 
-// src/services/merchantCategoryService.js
+// Returns root categories: [{ id, name }]
 export async function getAllCategories() {
   try {
-    const resp = await http.get(`/merchant-categories?limit=1000`);
-    const data = resp.data;
-    console.log("getAllCategories returned data :", data);
-
+    const res = await http.get(
+      `/merchant-categories?limit=1000&parent_id=null`,
+    );
     const raw =
-      (data && data.items) ||
-      (data && data.data && (data.data.rows || data.data.items)) ||
-      (data && data.data) ||
-      data ||
+      res.data?.data?.rows ||
+      res.data?.data?.items ||
+      res.data?.data ||
+      res.data ||
       [];
-
     const arr = Array.isArray(raw) ? raw : [];
-
-    return arr.map((cat) => ({
-      id: cat.id ?? cat._id ?? null,
-      name: cat.name ?? cat.category_name ?? String(cat.id ?? cat._id ?? ""),
-    }));
+    return arr
+      .filter((c) => c.parent_id == null)
+      .map((c) => ({
+        id: c.id,
+        name: c.name ?? String(c.id),
+      }));
   } catch (err) {
     console.error("Error in getAllCategories:", err);
+    return [];
+  }
+}
+
+// Returns subcategories for a given parent category id: [{ id, name }]
+export async function getSubcategoriesByCategoryId(categoryId) {
+  if (!categoryId) return [];
+  try {
+    const res = await http.get(
+      `/merchant-categories?limit=1000&parent_id=${categoryId}`,
+    );
+    const raw =
+      res.data?.data?.rows ||
+      res.data?.data?.items ||
+      res.data?.data ||
+      res.data ||
+      [];
+    const arr = Array.isArray(raw) ? raw : [];
+    return arr
+      .filter((c) => Number(c.parent_id) === Number(categoryId))
+      .map((c) => ({
+        id: c.id,
+        name: c.name ?? String(c.id),
+      }));
+  } catch (err) {
+    console.error("Error in getSubcategoriesByCategoryId:", err);
     return [];
   }
 }

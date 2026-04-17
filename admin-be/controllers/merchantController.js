@@ -105,6 +105,8 @@ export async function createMerchant(req, res) {
       // arrays (JSON)
       category_names: parseJSON(b.category_names, []),
       subcategories: parseJSON(b.subcategories, []),
+      category_id: toInt(b.category_id, null),
+      subcategory_id: toInt(b.subcategory_id, null),
       coupon_h2_blocks: parseJSON(b.coupon_h2_blocks, []),
       coupon_h3_blocks: parseJSON(b.coupon_h3_blocks, []),
       faqs: parseJSON(b.faqs, []),
@@ -263,6 +265,8 @@ export async function updateMerchant(req, res) {
         b.subcategories !== undefined
           ? parseJSON(b.subcategories, [])
           : undefined,
+      category_id: b.category_id !== undefined ? toInt(b.category_id, null) : undefined,
+      subcategory_id: b.subcategory_id !== undefined ? toInt(b.subcategory_id, null) : undefined,
       coupon_h2_blocks:
         b.coupon_h2_blocks !== undefined
           ? parseJSON(b.coupon_h2_blocks, [])
@@ -313,54 +317,6 @@ export async function updateMerchant(req, res) {
         });
       patch.logo_url = url;
     }
-    // if (f.top_banner?.[0]) {
-    //   const file = f.top_banner[0];
-    //   console.log(
-    //     "uploading",
-    //     file.originalname,
-    //     "size",
-    //     file.size,
-    //     "buffer?",
-    //     !!file.buffer
-    //   );
-    //   const { url, error } = await uploadImageBuffer(
-    //     BUCKET,
-    //     FOLDER,
-    //     file.buffer,
-    //     file.originalname,
-    //     file.mimetype
-    //   );
-    //   if (error)
-    //     return res.status(500).json({
-    //       data: null,
-    //       error: { message: "Top banner upload failed", details: error },
-    //     });
-    //   patch.top_banner_url = url;
-    // }
-    // if (f.side_banner?.[0]) {
-    //   const file = f.side_banner[0];
-    //   console.log(
-    //     "uploading",
-    //     file.originalname,
-    //     "size",
-    //     file.size,
-    //     "buffer?",
-    //     !!file.buffer
-    //   );
-    //   const { url, error } = await uploadImageBuffer(
-    //     BUCKET,
-    //     FOLDER,
-    //     file.buffer,
-    //     file.originalname,
-    //     file.mimetype
-    //   );
-    //   if (error)
-    //     return res.status(500).json({
-    //       data: null,
-    //       error: { message: "Side banner upload failed", details: error },
-    //     });
-    //   patch.side_banner_url = url;
-    // }
 
     const updated = await merchantRepo.update(id, patch);
     return res.json({ data: updated, error: null });

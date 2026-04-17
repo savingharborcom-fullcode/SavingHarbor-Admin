@@ -5,7 +5,10 @@ import {
   updateMerchant,
   uploadMerchantImage,
 } from "../../services/merchantService";
-import { getAllCategories } from "../../services/merchantCategoryService.js";
+import {
+  getAllCategories,
+  getSubcategoriesByCategoryId,
+} from "../../services/merchantCategoryService.js";
 import useEscClose from "../hooks/useEscClose";
 import SafeQuill from "../common/SafeQuill.jsx";
 
@@ -26,9 +29,15 @@ export default function EditMerchantModal({ merchantId, onClose, onSave }) {
   const [faqs, setFaqs] = useState([]);
   const [suggestions, setSuggestions] = useState([]);
 
-  // --- new: all categories list + loading state
   const [allCategories, setAllCategories] = useState([]);
   const [loadingCats, setLoadingCats] = useState(true);
+
+  const [categoryId, setCategoryId] = useState("");
+  const [subcategoryId, setSubcategoryId] = useState("");
+  const [allSubcategories, setAllSubcategories] = useState([]);
+  const [loadingSubs, setLoadingSubs] = useState(false);
+
+  const isFirstCategoryLoad = useRef(true);
 
   // Temp inputs for list sections
   const [categoryInput, setCategoryInput] = useState("");
@@ -42,6 +51,7 @@ export default function EditMerchantModal({ merchantId, onClose, onSave }) {
   const [tempSuggestion, setTempSuggestion] = useState("");
   const quillRef = useRef(null);
 
+  // Load merchant data
   useEffect(() => {
     let mounted = true;
     (async () => {
@@ -50,7 +60,6 @@ export default function EditMerchantModal({ merchantId, onClose, onSave }) {
         const m = await getMerchant(merchantId);
         if (!mounted) return;
 
-        // Normalize incoming data to the same shape the Add form uses
         setForm({
           name: m?.name || "",
           slug: m?.slug || "",
@@ -83,18 +92,19 @@ export default function EditMerchantModal({ merchantId, onClose, onSave }) {
 
         setCategories(Array.isArray(m?.category_names) ? m.category_names : []);
         setBrandCategories(
-          Array.isArray(m?.subcategories) ? m.subcategories : []
+          Array.isArray(m?.subcategories) ? m.subcategories : [],
         );
         setCouponH2Blocks(
-          Array.isArray(m?.coupon_h2_blocks) ? m.coupon_h2_blocks : []
+          Array.isArray(m?.coupon_h2_blocks) ? m.coupon_h2_blocks : [],
         );
         setCouponH3Blocks(
-          Array.isArray(m?.coupon_h3_blocks) ? m.coupon_h3_blocks : []
+          Array.isArray(m?.coupon_h3_blocks) ? m.coupon_h3_blocks : [],
         );
         setFaqs(Array.isArray(m?.faqs) ? m.faqs : []);
         setSuggestions(Array.isArray(m?.suggestions) ? m.suggestions : []);
-
         setLogoPreview(m?.logo_url || m?.logo || "");
+        setCategoryId(m?.category_id || "");
+        setSubcategoryId(m?.subcategory_id || "");
       } catch (e) {
         console.error("Failed to load merchant:", e?.message || e);
         setForm({
@@ -136,7 +146,7 @@ export default function EditMerchantModal({ merchantId, onClose, onSave }) {
     };
   }, [merchantId]); // eslint-disable-line
 
-  // fetch all categories (from merchant_categories table)
+  // Fetch all categories
   useEffect(() => {
     let mounted = true;
     (async () => {
@@ -144,15 +154,7 @@ export default function EditMerchantModal({ merchantId, onClose, onSave }) {
         setLoadingCats(true);
         const res = await getAllCategories();
         if (!mounted) return;
-        if (!Array.isArray(res) || res.length === 0) {
-          setAllCategories([]);
-          return;
-        }
-        const normalized = res.map((c) =>
-          typeof c === "string" ? c : c.name ?? c.category_name ?? String(c.id)
-        );
-
-        setAllCategories(normalized);
+        setAllCategories(Array.isArray(res) ? res : []);
       } catch (err) {
         console.error("Could not fetch categories:", err);
         setAllCategories([]);
@@ -164,6 +166,32 @@ export default function EditMerchantModal({ merchantId, onClose, onSave }) {
       mounted = false;
     };
   }, []);
+
+  // Fetch subcategories when categoryId changes
+  useEffect(() => {
+    if (!categoryId) {
+      setAllSubcategories([]);
+      if (!isFirstCategoryLoad.current) setSubcategoryId("");
+      return;
+    }
+    let mounted = true;
+    (async () => {
+      setLoadingSubs(true);
+      if (!isFirstCategoryLoad.current) setSubcategoryId("");
+      isFirstCategoryLoad.current = false;
+      try {
+        const res = await getSubcategoriesByCategoryId(categoryId);
+        if (mounted) setAllSubcategories(Array.isArray(res) ? res : []);
+      } catch {
+        if (mounted) setAllSubcategories([]);
+      } finally {
+        if (mounted) setLoadingSubs(false);
+      }
+    })();
+    return () => {
+      mounted = false;
+    };
+  }, [categoryId]);
 
   const handleChange = (e) => {
     const { name, value, type, checked } = e.target;
@@ -296,12 +324,14 @@ export default function EditMerchantModal({ merchantId, onClose, onSave }) {
     fd.append("is_header_2", String(!!form.is_header_2));
     fd.append(
       "coupon_icon_visibility",
-      form.coupon_icon_visibility || "visible"
+      form.coupon_icon_visibility || "visible",
     );
     fd.append(
       "store_status_visibility",
-      form.store_status_visibility || "visible"
+      form.store_status_visibility || "visible",
     );
+    fd.append("category_id", categoryId || "");
+    fd.append("subcategory_id", subcategoryId || "");
 
     if (logo) fd.append("logo", logo);
 
@@ -324,7 +354,6 @@ export default function EditMerchantModal({ merchantId, onClose, onSave }) {
     }
   };
 
-  // ✅ Custom image handler with ref forwarding
   const imageHandler = () => {
     const input = document.createElement("input");
     input.type = "file";
@@ -334,7 +363,6 @@ export default function EditMerchantModal({ merchantId, onClose, onSave }) {
     input.onchange = async () => {
       const file = input.files?.[0];
       if (!file) return;
-
       try {
         const url = await uploadMerchantImage(file);
         if (url) {
@@ -358,7 +386,7 @@ export default function EditMerchantModal({ merchantId, onClose, onSave }) {
     "italic",
     "underline",
     "strike",
-    "list", // ← only "list" here; toolbar still shows ordered/bullet
+    "list",
     "link",
     "image",
   ];
@@ -374,11 +402,7 @@ export default function EditMerchantModal({ merchantId, onClose, onSave }) {
       ],
       handlers: { image: imageHandler },
     },
-    history: {
-      delay: 500,
-      maxStack: 200,
-      userOnly: true,
-    },
+    history: { delay: 500, maxStack: 200, userOnly: true },
     keyboard: {
       bindings: {
         undo: {
@@ -407,21 +431,17 @@ export default function EditMerchantModal({ merchantId, onClose, onSave }) {
     },
   };
 
-  // ✅ Harden undo/redo with a direct keydown fallback on the editor root
   useEffect(() => {
     const editor = quillRef.current?.getEditor?.();
     if (!editor) return;
-
     const root = editor.root;
     const history = editor.getModule("history");
     const isMac =
       typeof navigator !== "undefined" &&
       /Mac|iPod|iPhone|iPad/.test(navigator.platform);
-
     const onKeyDown = (e) => {
       const ctrlOrCmd = isMac ? e.metaKey : e.ctrlKey;
       if (!ctrlOrCmd) return;
-
       const key = e.key?.toLowerCase?.();
       if (key === "z" && !e.shiftKey) {
         e.preventDefault();
@@ -431,12 +451,10 @@ export default function EditMerchantModal({ merchantId, onClose, onSave }) {
         history.redo();
       }
     };
-
     root.addEventListener("keydown", onKeyDown);
     return () => root.removeEventListener("keydown", onKeyDown);
   }, [quillRef]);
 
-  // close on ESC
   useEscClose(onClose);
 
   if (loading || !form) {
@@ -480,23 +498,66 @@ export default function EditMerchantModal({ merchantId, onClose, onSave }) {
             />
           </div>
 
-          {/* Categories dropdown + add */}
+          {/* Category / Subcategory */}
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div>
+              <label className="block mb-1">Category</label>
+              <select
+                value={categoryId}
+                onChange={(e) => setCategoryId(e.target.value)}
+                className="w-full border px-3 py-2 rounded"
+                disabled={loadingCats}
+              >
+                <option value="">
+                  {loadingCats ? "Loading…" : "Select category"}
+                </option>
+                {allCategories.map((c) => (
+                  <option key={c.id} value={c.id}>
+                    {c.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label className="block mb-1">Subcategory</label>
+              <select
+                value={subcategoryId}
+                onChange={(e) => setSubcategoryId(e.target.value)}
+                className="w-full border px-3 py-2 rounded"
+                disabled={!categoryId || loadingSubs}
+              >
+                <option value="">
+                  {!categoryId
+                    ? "Select category first"
+                    : loadingSubs
+                      ? "Loading…"
+                      : "Select subcategory"}
+                </option>
+                {allSubcategories.map((s) => (
+                  <option key={s.id} value={s.id}>
+                    {s.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+          </div>
+
+          {/* Category Names (tags) */}
           <div>
-            <label className="block mb-1">Category</label>
+            <label className="block mb-1">Category Names (tags)</label>
             <div className="flex gap-2">
               <select
                 value={categoryInput}
                 onChange={(e) => setCategoryInput(e.target.value)}
                 className="flex-1 border px-3 py-2 rounded"
                 disabled={loadingCats}
-                aria-label="Select category to add"
               >
                 <option value="">
                   {loadingCats ? "Loading categories…" : "Select a category"}
                 </option>
                 {allCategories.map((c) => (
-                  <option key={c} value={c}>
-                    {c}
+                  <option key={c.id} value={c.name}>
+                    {c.name}
                   </option>
                 ))}
               </select>
@@ -513,12 +574,12 @@ export default function EditMerchantModal({ merchantId, onClose, onSave }) {
                 {categories.map((c) => (
                   <span
                     key={c}
-                    className="px-2 py-1 bg-gray-100 rounded border"
+                    className="px-2 py-1 bg-gray-100 rounded border flex items-center gap-2"
                   >
-                    {c}
+                    <span className="text-sm">{c}</span>
                     <button
                       type="button"
-                      className="ml-2 text-red-600"
+                      className="ml-1 text-red-600 hover:text-red-800"
                       onClick={() => removeCategory(c)}
                     >
                       ×
@@ -625,7 +686,7 @@ export default function EditMerchantModal({ merchantId, onClose, onSave }) {
             />
           </div>
 
-          {/* Rich text blocks */}
+          {/* Rich text */}
           <div>
             <label className="block mb-1">Side Description</label>
             <textarea
@@ -652,7 +713,8 @@ export default function EditMerchantModal({ merchantId, onClose, onSave }) {
               />
             </div>
           </div>
-          {/* Ads Description + Brand Category */}
+
+          {/* Brand Category */}
           <div>
             <div className="flex gap-2 items-end">
               <div className="flex-1">
@@ -706,7 +768,7 @@ export default function EditMerchantModal({ merchantId, onClose, onSave }) {
             <Bool name="show_at_search_bar" label="Show at Search Bar" />
             <Bool name="extension_active" label="Extension Active" />
             <Bool name="extension_mandatory" label="Extension Mandatory" />
-            <Bool name="is_header_2" label="Is Header" />
+            <Bool name="is_header_2" label="Is Header 2" />
           </div>
 
           {/* Radios */}

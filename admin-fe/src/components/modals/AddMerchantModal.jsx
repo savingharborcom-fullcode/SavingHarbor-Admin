@@ -4,7 +4,10 @@ import {
   addMerchant,
   uploadMerchantImage,
 } from "../../services/merchantService";
-import { getAllCategories } from "../../services/merchantCategoryService.js";
+import {
+  getAllCategories,
+  getSubcategoriesByCategoryId,
+} from "../../services/merchantCategoryService.js";
 import useEscClose from "../hooks/useEscClose";
 import SafeQuill from "../common/SafeQuill.jsx";
 
@@ -48,6 +51,11 @@ export default function AddMerchantModal({ onClose, onSave }) {
   const [allCategories, setAllCategories] = useState([]); // fetched from backend
   const [loadingCats, setLoadingCats] = useState(true);
 
+  const [categoryId, setCategoryId] = useState("");
+  const [subcategoryId, setSubcategoryId] = useState("");
+  const [allSubcategories, setAllSubcategories] = useState([]);
+  const [loadingSubs, setLoadingSubs] = useState(false);
+
   const [brandCategories, setBrandCategories] = useState([]); // inline-added
 
   const [couponH2Blocks, setCouponH2Blocks] = useState([]); // [{heading, description}]
@@ -58,28 +66,16 @@ export default function AddMerchantModal({ onClose, onSave }) {
   const [saving, setSaving] = useState(false);
   const quillRef = useRef(null);
 
-  // Fetch available categories from backend once
+  // Load root categories
   useEffect(() => {
     let mounted = true;
     (async () => {
       try {
         setLoadingCats(true);
-        const res = await getAllCategories(); // already returns an array
-        if (!mounted) return;
-
-        if (!Array.isArray(res) || res.length === 0) {
-          setAllCategories([]);
-          return;
-        }
-
-        const normalized = res.map((c) =>
-          typeof c === "string" ? c : c.name ?? c.category_name ?? String(c.id)
-        );
-
-        setAllCategories(normalized);
-      } catch (err) {
-        console.error("Could not fetch categories:", err);
-        setAllCategories([]);
+        const res = await getAllCategories();
+        if (mounted) setAllCategories(Array.isArray(res) ? res : []);
+      } catch {
+        if (mounted) setAllCategories([]);
       } finally {
         if (mounted) setLoadingCats(false);
       }
@@ -88,6 +84,30 @@ export default function AddMerchantModal({ onClose, onSave }) {
       mounted = false;
     };
   }, []);
+
+  useEffect(() => {
+    if (!categoryId) {
+      setAllSubcategories([]);
+      setSubcategoryId("");
+      return;
+    }
+    let mounted = true;
+    (async () => {
+      setLoadingSubs(true);
+      setSubcategoryId("");
+      try {
+        const res = await getSubcategoriesByCategoryId(categoryId);
+        if (mounted) setAllSubcategories(Array.isArray(res) ? res : []);
+      } catch {
+        if (mounted) setAllSubcategories([]);
+      } finally {
+        if (mounted) setLoadingSubs(false);
+      }
+    })();
+    return () => {
+      mounted = false;
+    };
+  }, [categoryId]);
 
   const handleChange = (e) => {
     const { name, value, type, checked } = e.target;
@@ -114,7 +134,7 @@ export default function AddMerchantModal({ onClose, onSave }) {
       setCategories((arr) => [...arr, v]);
     }
     setForm((f) => ({ ...f, category_input: "" }));
- };
+  };
 
   const removeCategory = (v) => {
     setCategories((arr) => arr.filter((x) => x !== v));
@@ -236,6 +256,9 @@ export default function AddMerchantModal({ onClose, onSave }) {
     setFaqs([]);
     setSuggestions([]);
     pickLogo(null);
+    setCategoryId("");
+    setSubcategoryId("");
+    setAllSubcategories([]);
   };
 
   const handleSubmit = async (e) => {
@@ -271,7 +294,8 @@ export default function AddMerchantModal({ onClose, onSave }) {
     fd.append("is_header_2", String(!!form.is_header_2));
     fd.append("coupon_icon_visibility", form.coupon_icon_visibility);
     fd.append("store_status_visibility", form.store_status_visibility);
-
+    fd.append("category_id", categoryId || "");
+    fd.append("subcategory_id", subcategoryId || "");
     if (logo) fd.append("logo", logo);
 
     // arrays as JSON
@@ -469,66 +493,47 @@ export default function AddMerchantModal({ onClose, onSave }) {
           </div>
 
           {/* Category + Add category (REPLACED: native multi-select + chips + typed add) */}
-          <div>
-            <label className="block mb-1">Category</label>
-
-            {/* Dropdown add UX */}
-            <div className="flex gap-2">
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            <div>
+              <label className="block mb-1">Category</label>
               <select
-                name="category_input"
-                value={form.category_input}
-                onChange={(e) =>
-                  setForm((f) => ({ ...f, category_input: e.target.value }))
-                }
-                className="flex-1 border px-3 py-2 rounded"
+                value={categoryId}
+                onChange={(e) => setCategoryId(e.target.value)}
+                className="w-full border px-3 py-2 rounded"
                 disabled={loadingCats}
-                aria-label="Select category to add"
               >
                 <option value="">
-                  {loadingCats ? "Loading categories…" : "Select a category"}
+                  {loadingCats ? "Loading…" : "Select category"}
                 </option>
                 {allCategories.map((c) => (
-                  <option key={c} value={c}>
-                    {c}
+                  <option key={c.id} value={c.id}>
+                    {c.name}
                   </option>
                 ))}
               </select>
-
-              <button
-                type="button"
-                className="bg-blue-600 text-white px-3 py-2 rounded"
-                onClick={() => {
-                  const v = String(form.category_input || "").trim();
-                  if (!v) return;
-                  if (!categories.includes(v))
-                    setCategories((arr) => [...arr, v]);
-                  setForm((f) => ({ ...f, category_input: "" }));
-                }}
-              >
-                + Add
-              </button>
             </div>
-            {/* Selected chips */}
-            {categories.length > 0 && (
-              <div className="mt-2 flex flex-wrap gap-2">
-                {categories.map((c) => (
-                  <span
-                    key={c}
-                    className="px-2 py-1 bg-gray-100 rounded border flex items-center gap-2"
-                  >
-                    <span className="text-sm">{c}</span>
-                    <button
-                      type="button"
-                      className="ml-1 text-red-600 hover:text-red-800"
-                      onClick={() => removeCategory(c)}
-                      aria-label={`Remove category ${c}`}
-                    >
-                      ×
-                    </button>
-                  </span>
+            <div>
+              <label className="block mb-1">Subcategory</label>
+              <select
+                value={subcategoryId}
+                onChange={(e) => setSubcategoryId(e.target.value)}
+                className="w-full border px-3 py-2 rounded"
+                disabled={!categoryId || loadingSubs}
+              >
+                <option value="">
+                  {!categoryId
+                    ? "Select category first"
+                    : loadingSubs
+                      ? "Loading…"
+                      : "Select subcategory"}
+                </option>
+                {allSubcategories.map((s) => (
+                  <option key={s.id} value={s.id}>
+                    {s.name}
+                  </option>
                 ))}
-              </div>
-            )}
+              </select>
+            </div>
           </div>
 
           {/* Web / Affiliate / Tracker / H1 */}
