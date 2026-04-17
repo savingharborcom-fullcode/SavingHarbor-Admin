@@ -15,7 +15,7 @@ export async function ensureUniqueSlug(base) {
   let slug = seed;
   for (let i = 0; i < 50; i++) {
     const { data, error } = await supabase
-      .from("merchant_categories")
+      .from("merchant_categories_v2")
       .select("id")
       .eq("slug", slug)
       .limit(1);
@@ -31,7 +31,7 @@ export async function ensureUniqueSlugOnUpdate(id, proposed) {
   let slug = seed;
   for (let i = 0; i < 50; i++) {
     const { data, error } = await supabase
-      .from("merchant_categories")
+      .from("merchant_categories_v2")
       .select("id")
       .eq("slug", slug)
       .neq("id", id)
@@ -69,7 +69,7 @@ export async function list({
 
   // Count
   let countQ = supabase
-    .from("merchant_categories")
+    .from("merchant_categories_v2")
     .select("id", { count: "exact", head: true });
   if (name) countQ = countQ.ilike("name", `%${name}%`);
   if (show_home !== undefined) countQ = countQ.eq("show_home", !!show_home);
@@ -82,7 +82,7 @@ export async function list({
 
   // Data
   let q = supabase
-    .from("merchant_categories")
+    .from("merchant_categories_v2")
     .select(selectCols)
     .order("created_at", { ascending: false })
     .range(from, to);
@@ -123,7 +123,7 @@ export async function getById(id) {
     updated_at
   `;
   const { data, error } = await supabase
-    .from("merchant_categories")
+    .from("merchant_categories_v2")
     .select(selectCols)
     .eq("id", id)
     .single();
@@ -135,7 +135,7 @@ export async function getById(id) {
 export async function insert(payload) {
   const toInsert = { ...payload };
   const { data, error } = await supabase
-    .from("merchant_categories")
+    .from("merchant_categories_v2")
     .insert(toInsert)
     .select()
     .single();
@@ -152,7 +152,7 @@ export async function update(id, patch) {
     return await getById(id);
   }
   const { data, error } = await supabase
-    .from("merchant_categories")
+    .from("merchant_categories_v2")
     .update(clean)
     .eq("id", id)
     .select()
@@ -164,14 +164,14 @@ export async function update(id, patch) {
 // Toggle publish
 export async function toggleStatus(id) {
   const { data: cur, error: ge } = await supabase
-    .from("merchant_categories")
+    .from("merchant_categories_v2")
     .select("is_publish")
     .eq("id", id)
     .single();
   if (ge) throw ge;
   const next = !cur?.is_publish;
   const { data, error } = await supabase
-    .from("merchant_categories")
+    .from("merchant_categories_v2")
     .update({ is_publish: next, updated_at: new Date().toISOString() })
     .eq("id", id)
     .select()
@@ -183,7 +183,7 @@ export async function toggleStatus(id) {
 // Delete
 export async function remove(id) {
   const { error } = await supabase
-    .from("merchant_categories")
+    .from("merchant_categories_v2")
     .delete()
     .eq("id", id);
   if (error) throw error;
