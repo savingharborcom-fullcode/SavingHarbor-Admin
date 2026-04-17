@@ -50,48 +50,43 @@ export async function list({
   show_deals_page,
   is_publish,
   is_header,
+  parent_id,
   page = 1,
   limit = 20,
 } = {}) {
   const from = (page - 1) * limit;
   const to = from + limit - 1;
 
-  const selectCols = `
-    id,
-    name,
-    slug,
-    show_home,
-    show_deals_page,
-    is_publish,
-    is_header,
-    created_at
-  `;
+  const selectCols = `id, name, slug, parent_id, show_home, show_deals_page, is_publish, is_header, created_at`;
 
-  // Count
+  const applyFilters = (q) => {
+    if (name) q = q.ilike("name", `%${name}%`);
+    if (show_home !== undefined) q = q.eq("show_home", !!show_home);
+    if (show_deals_page !== undefined)
+      q = q.eq("show_deals_page", !!show_deals_page);
+    if (is_publish !== undefined) q = q.eq("is_publish", !!is_publish);
+    if (is_header !== undefined) q = q.eq("is_header", !!is_header);
+    if (parent_id === null || parent_id === "null") {
+      q = q.is("parent_id", null);
+    } else if (parent_id !== undefined) {
+      q = q.eq("parent_id", Number(parent_id));
+    }
+    return q;
+  };
+
   let countQ = supabase
-    .from("merchant_categories_v2")
+    .from("merchant_categories")
     .select("id", { count: "exact", head: true });
-  if (name) countQ = countQ.ilike("name", `%${name}%`);
-  if (show_home !== undefined) countQ = countQ.eq("show_home", !!show_home);
-  if (show_deals_page !== undefined)
-    countQ = countQ.eq("show_deals_page", !!show_deals_page);
-  if (is_publish !== undefined) countQ = countQ.eq("is_publish", !!is_publish);
-  if (is_header !== undefined) countQ = countQ.eq("is_header", !!is_header);
+  countQ = applyFilters(countQ);
   const { count, error: countErr } = await countQ;
   if (countErr) throw countErr;
 
-  // Data
   let q = supabase
-    .from("merchant_categories_v2")
+    .from("merchant_categories")
     .select(selectCols)
-    .order("created_at", { ascending: false })
+    .order("name", { ascending: true })
     .range(from, to);
-  if (name) q = q.ilike("name", `%${name}%`);
-  if (show_home !== undefined) q = q.eq("show_home", !!show_home);
-  if (show_deals_page !== undefined)
-    q = q.eq("show_deals_page", !!show_deals_page);
-  if (is_publish !== undefined) q = q.eq("is_publish", !!is_publish);
-  if (is_header !== undefined) q = q.eq("is_header", !!is_header);
+  q = applyFilters(q);
 
   const { data, error } = await q;
   if (error) throw error;
@@ -146,7 +141,7 @@ export async function insert(payload) {
 // Update (drops undefined)
 export async function update(id, patch) {
   const clean = Object.fromEntries(
-    Object.entries(patch).filter(([_, v]) => v !== undefined)
+    Object.entries(patch).filter(([_, v]) => v !== undefined),
   );
   if (Object.keys(clean).length === 0) {
     return await getById(id);
