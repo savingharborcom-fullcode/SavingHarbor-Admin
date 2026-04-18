@@ -1,104 +1,120 @@
 /**
- * ─── EXPRESS BACKEND ENDPOINT REQUIRED ───────────────────────────
- *
- * Add this route to your Node/Express backend on Render.
- * It reads from your Supabase DB and returns the data
- * this engine needs to enrich content generation.
- *
- * GET /api/seo/merchant-data?slug=healthyline-coupons
- *
- * ─────────────────────────────────────────────────────────────────
- *
+ * SEO routes
+ * GET  /api/seo/merchant-data?slug=   — pull merchant + coupon stats
+ * PATCH /api/seo/merchant-content      — save generated content to merchants table
+ * GET  /api/seo/crawl?url=            — server-side crawl proxy (fixes CORS)
  */
+
 import express from "express";
-import {supabase} from "../dbhelper/dbclient.js";
+import { supabase } from "../dbhelper/dbclient.js";
 
 const router = express.Router();
 
-// routes/seo.js
+// ─── GET /api/seo/merchant-data ───────────────────────────────────
 router.get("/merchant-data", async (req, res) => {
   const { slug } = req.query;
   if (!slug) return res.status(400).json({ error: "slug required" });
 
   try {
-    // 1. Get merchant
-    const { data: merchant } = await supabase
+    // 1. Merchant
+    const { data: merchant, error: mErr } = await supabase
       .from("merchants")
-      .select("id, name, category_id, web_url")
+      .select("id, name, web_url, category_id, active_coupons_count")
       .eq("slug", slug)
       .single();
 
-    if (!merchant) return res.status(404).json({ error: "Merchant not found" });
+    if (mErr || !merchant)
+      return res.status(404).json({ error: "Merchant not found" });
 
-    // 2. Get all coupons for this merchant
-    const { data: coupons } = await supabase
-      .from("coupons")
-      .select(
-        "id, title, code, discount_type, discount_value, is_active, expires_at",
-      )
-      .eq("merchant_id", merchant.id)
-      .eq("is_publish", true)
-      .order("discount_value", { ascending: false })
-      .limit(20);
-
-    const { data: merchantCategory } = await supabase
+    // 2. Category name
+    const { data: categoryRow } = await supabase
       .from("merchant_categories_v2")
-      .select("id, name ")
+      .select("name")
       .eq("id", merchant.category_id)
       .single();
 
+    // 3. Coupons — correct column names from actual schema
+    // active = is_publish true
+    // coupon_type: 'coupon' | 'deal'
+    // discount_type: 'percent' | 'flat' | 'none'
+    // code column: coupon_code (not code)
+    const { data: coupons, error: cErr } = await supabase
+      .from("coupons")
+      .select(
+        "id, title, coupon_code, coupon_type, discount_type, discount_value, currency",
+      )
+      .eq("merchant_id", merchant.id)
+      .eq("is_publish", true)
+      .order("discount_value", { ascending: false, nullsFirst: false })
+      .limit(20);
+
+    if (cErr) throw cErr;
+
     const activeCoupons = coupons || [];
 
-    // 3. Compute useful stats
+    // 4. Stats
     const pctCoupons = activeCoupons.filter(
-      (c) => c.discount_type === "percentage",
+      (c) => c.discount_type === "percent" && c.discount_value,
     );
-    const flatCoupons = activeCoupons.filter((c) => c.discount_type === "flat");
+    const flatCoupons = activeCoupons.filter(
+      (c) => c.discount_type === "flat" && c.discount_value,
+    );
+
     const maxDiscount = pctCoupons.length
-      ? Math.max(...pctCoupons.map((c) => c.discount_value || 0))
+      ? Math.max(...pctCoupons.map((c) => Number(c.discount_value)))
       : null;
+
     const avgDiscount = pctCoupons.length
       ? Math.round(
-          pctCoupons.reduce((s, c) => s + (c.discount_value || 0), 0) /
+          pctCoupons.reduce((s, c) => s + Number(c.discount_value), 0) /
             pctCoupons.length,
         )
       : null;
-    const couponTypes = [...new Set(activeCoupons.map((c) => c.discount_type))];
 
-    // 4. Return structured payload
-    res.json({
+    const maxFlat = flatCoupons.length
+      ? Math.max(...flatCoupons.map((c) => Number(c.discount_value)))
+      : null;
+
+    const couponTypes = [
+      ...new Set(activeCoupons.map((c) => c.discount_type).filter(Boolean)),
+    ];
+
+    const hasNewUserOffer = activeCoupons.some((c) =>
+      ["new", "first"].some((kw) => (c.title || "").toLowerCase().includes(kw)),
+    );
+
+    // 5. Response — field names the frontend expects
+    return res.json({
       merchantId: merchant.id,
       name: merchant.name,
-      category: merchantCategory.name,
-      totalCoupons: activeCoupons.length,
-      totalDeals: activeCoupons.filter((c) => !c.code).length,
-      maxDiscount,
-      avgDiscount,
-      couponTypes,
-      hasFreeShipping: activeCoupons.some(
-        (c) => c.discount_type === "free_shipping",
-      ),
-      hasNewUserOffer: activeCoupons.some(
-        (c) =>
-          (c.title || "").toLowerCase().includes("new") ||
-          (c.title || "").toLowerCase().includes("first"),
-      ),
+      webUrl: merchant.web_url,
+      category: categoryRow?.name || null,
+      totalCoupons: activeCoupons.filter((c) => c.coupon_type === "coupon")
+        .length,
+      totalDeals: activeCoupons.filter((c) => c.coupon_type === "deal").length,
+      maxDiscount, // highest % off
+      avgDiscount, // avg % off
+      maxFlatDiscount: maxFlat,
+      couponTypes, // ['percent','flat','none']
+      hasFreeShipping: false, // no free_shipping type in this schema — flag kept for prompt compat
+      hasNewUserOffer,
       coupons: activeCoupons.slice(0, 10).map((c) => ({
         title: c.title,
-        code: c.code,
+        code: c.coupon_code, // correct column name
         discountType: c.discount_type,
-        value: c.discount_value,
-        expires: c.expires_at,
+        value: c.discount_value ? Number(c.discount_value) : null,
+        currency: c.currency,
+        type: c.coupon_type, // 'coupon' | 'deal'
       })),
       lastUpdated: new Date().toISOString().split("T")[0],
     });
   } catch (err) {
-    console.error("SEO merchant data error:", err);
-    res.status(500).json({ error: "Internal error" });
+    console.error("merchant-data error:", err);
+    return res.status(500).json({ error: err.message || "Internal error" });
   }
 });
 
-// Columns this endpoint is allowed to write — whitelist, nothing else touches the merchants row
+// ─── PATCH /api/seo/merchant-content ─────────────────────────────
 const ALLOWED_CONTENT_FIELDS = new Set([
   "meta_title",
   "meta_description",
@@ -109,27 +125,20 @@ const ALLOWED_CONTENT_FIELDS = new Set([
   "coupon_h2_blocks",
   "coupon_h3_blocks",
 ]);
- 
+
 router.patch("/merchant-content", async (req, res) => {
   const { slug, content } = req.body;
- 
-  if (!slug) return res.status(400).json({ error: "slug is required" });
-  if (!content || typeof content !== "object") return res.status(400).json({ error: "content object is required" });
- 
-  // Strip any keys not in the whitelist — never let this endpoint touch operational columns
+  if (!slug) return res.status(400).json({ error: "slug required" });
+  if (!content || typeof content !== "object")
+    return res.status(400).json({ error: "content object required" });
+
   const payload = {};
   for (const [key, value] of Object.entries(content)) {
-    if (ALLOWED_CONTENT_FIELDS.has(key)) {
-      payload[key] = value;
-    }
+    if (ALLOWED_CONTENT_FIELDS.has(key)) payload[key] = value;
   }
- 
-  if (Object.keys(payload).length === 0) {
-    return res.status(400).json({ error: "No valid content fields provided" });
-  }
- 
-  // updated_at is handled by the DB trigger (trg_merchants_updated_at), no need to set it manually
- 
+  if (!Object.keys(payload).length)
+    return res.status(400).json({ error: "No valid content fields" });
+
   try {
     const { data, error } = await supabase
       .from("merchants")
@@ -137,10 +146,10 @@ router.patch("/merchant-content", async (req, res) => {
       .eq("slug", slug)
       .select("id, slug, name, updated_at")
       .single();
- 
+
     if (error) throw error;
-    if (!data) return res.status(404).json({ error: `No merchant found with slug: ${slug}` });
- 
+    if (!data) return res.status(404).json({ error: `No merchant: ${slug}` });
+
     return res.json({
       success: true,
       merchantId: data.id,
@@ -150,25 +159,27 @@ router.patch("/merchant-content", async (req, res) => {
       fieldsUpdated: Object.keys(payload),
     });
   } catch (err) {
-    console.error("merchant-content save error:", err);
+    console.error("merchant-content error:", err);
     return res.status(500).json({ error: err.message || "Internal error" });
   }
 });
 
-// GET /api/seo/crawl?url=https://www.bigmotion.ai/
+// ─── GET /api/seo/crawl ───────────────────────────────────────────
+// Server-side proxy — fixes CORS block on frontend direct fetch
 router.get("/crawl", async (req, res) => {
   const { url } = req.query;
   if (!url) return res.status(400).json({ error: "url required" });
 
   try {
     const response = await fetch(url, {
-      headers: { "User-Agent": "Mozilla/5.0 (compatible; SavingHarborBot/1.0)" },
+      headers: {
+        "User-Agent": "Mozilla/5.0 (compatible; SavingHarborBot/1.0)",
+      },
       signal: AbortSignal.timeout(10000),
     });
-    if (!response.ok) throw new Error(`Fetch failed ${response.status}`);
-    const html = await response.text();
+    if (!response.ok) throw new Error(`Upstream ${response.status}`);
 
-    // Strip tags, collapse whitespace, cap at 11000 chars
+    const html = await response.text();
     const text = html
       .replace(/<script[\s\S]*?<\/script>/gi, "")
       .replace(/<style[\s\S]*?<\/style>/gi, "")
@@ -177,9 +188,11 @@ router.get("/crawl", async (req, res) => {
       .trim()
       .substring(0, 11000);
 
-    res.json({ text: text.length > 100 ? text : "No substantial content found." });
+    return res.json({
+      text: text.length > 100 ? text : "No substantial content found.",
+    });
   } catch (err) {
-    res.json({ text: `CRAWL FAILED: ${err.message}` });
+    return res.json({ text: `CRAWL FAILED: ${err.message}` });
   }
 });
 
