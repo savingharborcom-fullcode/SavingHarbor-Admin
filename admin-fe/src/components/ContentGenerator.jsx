@@ -1,13 +1,10 @@
 /**
- * SavingHarbor — Content Architecture Variation Engine v2.2
- * Changes from v2.1:
- * - DB save after every generation (single + batch) via PATCH /api/seo/merchant-content
- * - buildDiscountSummary + formatDiscount built from scratch (were missing)
- * - SEO title: uses actual top discount value, no month/year
- * - Meta description: keyword-rich, specific, human — not AI filler
- * - LSI/semantic keywords injected naturally into section bodies via prompt
- * - Month/year removed from ALL fields
- * - H1 + all content forced unique per store using live DB facts in prompt
+ * SavingHarbor — Content Architecture Variation Engine v2.3
+ * Changes from v2.2:
+ * - Multi-key round-robin for batch — up to 10 Gemini keys, one key per store
+ * - Key rotation UI in config panel
+ * - Per-key usage counter displayed live during batch
+ * - On 429, auto-rotates to next available key and retries once
  */
 
 import { useState, useRef } from "react";
@@ -1178,10 +1175,13 @@ function SaveStatus({ status }) {
 
 // ─── MAIN COMPONENT ───────────────────────────────────────────────
 export default function VariationEngine() {
-  const [apiKey, setApiKey] = useState("");
+  const [apiKey, setApiKey] = useState(""); // used for single mode
+  const [apiKeys, setApiKeys] = useState([""]); // used for batch mode round-robin
   const [backendUrl, setBackendUrl] = useState(BACKEND_URL);
   const [model, setModel] = useState("gemini-2.5-flash-lite");
   const [useDB, setUseDB] = useState(true);
+  const [keyUsage, setKeyUsage] = useState({}); // { keyIndex: callCount }
+  const keyIdxRef = useRef(0); // current round-robin pointer
 
   const [merchant, setMerchant] = useState("");
   const [category, setCategory] = useState("");
@@ -1327,10 +1327,48 @@ export default function VariationEngine() {
     setRunning(false);
   };
 
+  // ── Round-robin key picker ──
+  const getNextKey = () => {
+    const valid = apiKeys
+      .map((k, i) => ({ k: k.trim(), i }))
+      .filter((x) => x.k);
+    if (!valid.length) return null;
+    const pick = valid[keyIdxRef.current % valid.length];
+    keyIdxRef.current = (keyIdxRef.current + 1) % valid.length;
+    return pick;
+  };
+
+  // ── callGemini with auto-rotate on 429 ──
+  const callGeminiRotated = async (prompt, keyEntry) => {
+    try {
+      return await callGemini(prompt, keyEntry.k, model);
+    } catch (e) {
+      // On quota error, try next key once
+      if (
+        e.message?.includes("429") ||
+        e.message?.toLowerCase().includes("quota")
+      ) {
+        const next = getNextKey();
+        if (next && next.i !== keyEntry.i) {
+          console.warn(
+            `Key ${keyEntry.i} quota hit — rotating to key ${next.i}`,
+          );
+          setKeyUsage((prev) => ({
+            ...prev,
+            [`key${keyEntry.i}`]: prev[`key${keyEntry.i}`] || 0,
+          }));
+          return await callGemini(prompt, next.k, model);
+        }
+      }
+      throw e;
+    }
+  };
+
   // ── Batch generate + save ──
   const runBatch = async () => {
-    if (!apiKey) {
-      setError("Enter your Gemini API key.");
+    const validKeys = apiKeys.map((k) => k.trim()).filter(Boolean);
+    if (!validKeys.length) {
+      setError("Add at least one Gemini API key for batch.");
       return;
     }
     const rows = parseBatch(batchText);
@@ -1345,12 +1383,21 @@ export default function VariationEngine() {
     stopRef.current = false;
     setRunning(true);
     setBatchTotal(rows.length);
+    keyIdxRef.current = 0;
+    setKeyUsage({});
 
     for (let i = 0; i < rows.length; i++) {
       if (stopRef.current) break;
       const r = rows[i];
       setBatchIdx(i + 1);
-      setStatus(`[${i + 1}/${rows.length}] ${r.name}`);
+
+      // Pick key for this store — round-robin
+      const keyEntry = getNextKey();
+      setStatus(`[${i + 1}/${rows.length}] ${r.name} — key ${keyEntry.i + 1}`);
+      setKeyUsage((prev) => ({
+        ...prev,
+        [`key${keyEntry.i}`]: (prev[`key${keyEntry.i}`] || 0) + 2,
+      }));
 
       let dbData = null;
       let crawledText = "";
@@ -1363,28 +1410,27 @@ export default function VariationEngine() {
       }
 
       try {
+        const researchPrompt = buildResearchPrompt(
+          r.name,
+          r.category,
+          r.url,
+          crawledText,
+          dbData,
+        );
         const research = safeJSON(
-          await callGemini(
-            buildResearchPrompt(r.name, r.category, r.url, crawledText, dbData),
-            apiKey,
-            model,
-          ),
+          await callGeminiRotated(researchPrompt, keyEntry),
         );
+
         const variation = getVariation(r.name, r.category);
-        const data = safeJSON(
-          await callGemini(
-            buildFinalPrompt(
-              r.name,
-              r.category,
-              research,
-              variation,
-              dbData,
-              r.url,
-            ),
-            apiKey,
-            model,
-          ),
+        const finalPrompt = buildFinalPrompt(
+          r.name,
+          r.category,
+          research,
+          variation,
+          dbData,
+          r.url,
         );
+        const data = safeJSON(await callGeminiRotated(finalPrompt, keyEntry));
 
         let savedOk = null;
         if (r.slug) {
@@ -1413,6 +1459,7 @@ export default function VariationEngine() {
             slug: r.slug,
             status: "done",
             saved: savedOk,
+            keyUsed: keyEntry.i + 1,
             ...data,
             variation,
             dbData,
@@ -1426,12 +1473,13 @@ export default function VariationEngine() {
             category: r.category,
             status: "error",
             error: e.message,
+            keyUsed: keyEntry.i + 1,
           },
         ]);
       }
 
       if (i < rows.length - 1)
-        await new Promise((res) => setTimeout(res, 1500));
+        await new Promise((res) => setTimeout(res, 1200));
     }
 
     setRunning(false);
@@ -1616,66 +1664,204 @@ export default function VariationEngine() {
         >
           Configuration
         </div>
-        <div
-          style={{
-            display: "grid",
-            gridTemplateColumns: "1fr 1fr",
-            gap: 10,
-            marginBottom: 10,
-          }}
-        >
-          <div>
-            <label
+
+        {/* Single mode — one key */}
+        {mode === "single" && (
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: "1fr 1fr",
+              gap: 10,
+              marginBottom: 10,
+            }}
+          >
+            <div>
+              <label
+                style={{
+                  fontSize: 12,
+                  fontWeight: 500,
+                  color: "var(--color-text-secondary)",
+                  display: "block",
+                  marginBottom: 4,
+                }}
+              >
+                Gemini API Key *
+              </label>
+              <input
+                type="password"
+                value={apiKey}
+                onChange={(e) => setApiKey(e.target.value)}
+                placeholder="AIzaSy•••••••••••"
+                style={inputStyle}
+                disabled={running}
+              />
+            </div>
+            <div>
+              <label
+                style={{
+                  fontSize: 12,
+                  fontWeight: 500,
+                  color: "var(--color-text-secondary)",
+                  display: "block",
+                  marginBottom: 4,
+                }}
+              >
+                Model
+              </label>
+              <select
+                value={model}
+                onChange={(e) => setModel(e.target.value)}
+                style={{ ...inputStyle, height: 36 }}
+                disabled={running}
+              >
+                <option value="gemini-2.5-flash-lite">
+                  gemini-2.5-flash-lite (1000 RPD free)
+                </option>
+                <option value="gemini-2.5-flash">
+                  gemini-2.5-flash (250 RPD free)
+                </option>
+                <option value="gemini-2.5-pro">
+                  gemini-2.5-pro (100 RPD free)
+                </option>
+              </select>
+            </div>
+          </div>
+        )}
+
+        {/* Batch mode — multi-key round-robin */}
+        {mode === "batch" && (
+          <div style={{ marginBottom: 10 }}>
+            <div
               style={{
-                fontSize: 12,
-                fontWeight: 500,
-                color: "var(--color-text-secondary)",
-                display: "block",
-                marginBottom: 4,
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+                marginBottom: 6,
               }}
             >
-              Gemini API Key *
-            </label>
-            <input
-              type="password"
-              value={apiKey}
-              onChange={(e) => setApiKey(e.target.value)}
-              placeholder="AIzaSy•••••••••••"
-              style={inputStyle}
-              disabled={running}
-            />
+              <label
+                style={{
+                  fontSize: 12,
+                  fontWeight: 500,
+                  color: "var(--color-text-secondary)",
+                }}
+              >
+                Gemini API Keys — Round-Robin (
+                {apiKeys.filter((k) => k.trim()).length} active)
+              </label>
+              <div style={{ display: "flex", gap: 6 }}>
+                <button
+                  onClick={() => setApiKeys((prev) => [...prev, ""])}
+                  disabled={running || apiKeys.length >= 10}
+                  style={{
+                    fontSize: 11,
+                    padding: "2px 8px",
+                    border: "0.5px solid var(--color-border-secondary)",
+                    borderRadius: 4,
+                    background: "var(--color-background-primary)",
+                    cursor: "pointer",
+                    fontFamily: "inherit",
+                  }}
+                >
+                  + Add Key
+                </button>
+                {apiKeys.length > 1 && (
+                  <button
+                    onClick={() => setApiKeys((prev) => prev.slice(0, -1))}
+                    disabled={running}
+                    style={{
+                      fontSize: 11,
+                      padding: "2px 8px",
+                      border: "0.5px solid #C04828",
+                      borderRadius: 4,
+                      background: "transparent",
+                      color: "#C04828",
+                      cursor: "pointer",
+                      fontFamily: "inherit",
+                    }}
+                  >
+                    − Remove
+                  </button>
+                )}
+              </div>
+            </div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              {apiKeys.map((k, i) => (
+                <div
+                  key={i}
+                  style={{ display: "flex", alignItems: "center", gap: 8 }}
+                >
+                  <span
+                    style={{
+                      fontSize: 11,
+                      color: "var(--color-text-tertiary)",
+                      width: 40,
+                      flexShrink: 0,
+                    }}
+                  >
+                    Key {i + 1}
+                  </span>
+                  <input
+                    type="password"
+                    value={k}
+                    onChange={(e) =>
+                      setApiKeys((prev) =>
+                        prev.map((x, j) => (j === i ? e.target.value : x)),
+                      )
+                    }
+                    placeholder="AIzaSy•••••••••••"
+                    style={{ ...inputStyle, flex: 1 }}
+                    disabled={running}
+                  />
+                  {keyUsage[`key${i}`] > 0 && (
+                    <span
+                      style={{
+                        fontSize: 10,
+                        padding: "1px 6px",
+                        background: "#E6F1FB",
+                        color: "#185FA5",
+                        borderRadius: 3,
+                        whiteSpace: "nowrap",
+                      }}
+                    >
+                      {keyUsage[`key${i}`]} calls
+                    </span>
+                  )}
+                </div>
+              ))}
+            </div>
+            <div style={{ marginTop: 8 }}>
+              <label
+                style={{
+                  fontSize: 12,
+                  fontWeight: 500,
+                  color: "var(--color-text-secondary)",
+                  display: "block",
+                  marginBottom: 4,
+                }}
+              >
+                Model
+              </label>
+              <select
+                value={model}
+                onChange={(e) => setModel(e.target.value)}
+                style={{ ...inputStyle, height: 36 }}
+                disabled={running}
+              >
+                <option value="gemini-2.5-flash-lite">
+                  gemini-2.5-flash-lite (1000 RPD/key free)
+                </option>
+                <option value="gemini-2.5-flash">
+                  gemini-2.5-flash (250 RPD/key free)
+                </option>
+                <option value="gemini-2.5-pro">
+                  gemini-2.5-pro (100 RPD/key free)
+                </option>
+              </select>
+            </div>
           </div>
-          <div>
-            <label
-              style={{
-                fontSize: 12,
-                fontWeight: 500,
-                color: "var(--color-text-secondary)",
-                display: "block",
-                marginBottom: 4,
-              }}
-            >
-              Model
-            </label>
-            <select
-              value={model}
-              onChange={(e) => setModel(e.target.value)}
-              style={{ ...inputStyle, height: 36 }}
-              disabled={running}
-            >
-              <option value="gemini-2.5-flash-lite">
-                gemini-2.5-flash-lite (most affordable)
-              </option>
-              <option value="gemini-1.5-pro">
-                gemini-1.5-pro (best quality)
-              </option>
-              <option value="gemini-2.0-flash">gemini-2.0-flash (fast)</option>
-              <option value="gemini-1.5-flash">
-                gemini-1.5-flash (cheapest)
-              </option>
-            </select>
-          </div>
-        </div>
+        )}
+
         <div
           style={{
             display: "grid",
@@ -2470,6 +2656,19 @@ export default function VariationEngine() {
                           r.variation?.tone?.label
                         : r.error}
                     </span>
+                    {r.keyUsed && (
+                      <span
+                        style={{
+                          fontSize: 10,
+                          padding: "1px 6px",
+                          background: "#f0f0f0",
+                          color: "#555",
+                          borderRadius: 3,
+                        }}
+                      >
+                        K{r.keyUsed}
+                      </span>
+                    )}
                     {r.dbData && (
                       <span
                         style={{
