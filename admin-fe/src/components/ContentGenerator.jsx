@@ -300,7 +300,6 @@ async function fetchPendingMerchants(backendUrl) {
 async function saveContentToDB(slug, content, backendUrl) {
   if (!slug) return { skipped: true, reason: "no slug" };
   try {
-    content.content_generated = true; // mark as generated when saving
     const res = await fetch(`${backendUrl}/api/seo/merchant-content`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },

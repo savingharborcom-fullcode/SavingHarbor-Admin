@@ -111,7 +111,6 @@ const ALLOWED_CONTENT_FIELDS = new Set([
   "faqs",
   "coupon_h2_blocks",
   "coupon_h3_blocks",
-  "content_generated",
 ]);
 
 router.patch("/merchant-content", async (req, res) => {
@@ -120,7 +119,7 @@ router.patch("/merchant-content", async (req, res) => {
   if (!content || typeof content !== "object") return res.status(400).json({ error: "content object required" });
 
   const payload = {};
-  // payload.content_generated = true; // mark as generated when content is saved
+  payload.content_generated = true; // mark as generated when content is saved
   for (const [key, value] of Object.entries(content)) {
     if (ALLOWED_CONTENT_FIELDS.has(key)) payload[key] = value;
   }
