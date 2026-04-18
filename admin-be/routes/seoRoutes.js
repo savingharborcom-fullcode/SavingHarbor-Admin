@@ -37,7 +37,7 @@ router.get("/merchant-data", async (req, res) => {
         "id, title, code, discount_type, discount_value, is_active, expires_at",
       )
       .eq("merchant_id", merchant.id)
-      .eq("is_active", true)
+      .eq("is_publish", true)
       .order("discount_value", { ascending: false })
       .limit(20);
 
@@ -154,5 +154,33 @@ router.patch("/merchant-content", async (req, res) => {
     return res.status(500).json({ error: err.message || "Internal error" });
   }
 });
- 
+
+// GET /api/seo/crawl?url=https://www.bigmotion.ai/
+router.get("/crawl", async (req, res) => {
+  const { url } = req.query;
+  if (!url) return res.status(400).json({ error: "url required" });
+
+  try {
+    const response = await fetch(url, {
+      headers: { "User-Agent": "Mozilla/5.0 (compatible; SavingHarborBot/1.0)" },
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!response.ok) throw new Error(`Fetch failed ${response.status}`);
+    const html = await response.text();
+
+    // Strip tags, collapse whitespace, cap at 11000 chars
+    const text = html
+      .replace(/<script[\s\S]*?<\/script>/gi, "")
+      .replace(/<style[\s\S]*?<\/style>/gi, "")
+      .replace(/<[^>]+>/g, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .substring(0, 11000);
+
+    res.json({ text: text.length > 100 ? text : "No substantial content found." });
+  } catch (err) {
+    res.json({ text: `CRAWL FAILED: ${err.message}` });
+  }
+});
+
 export default router;

@@ -15,22 +15,19 @@ import { useState, useRef } from "react";
 const BACKEND_URL = "https://admin-api.savingharbor.com";
 
 // ─── CRAWL ────────────────────────────────────────────────────────
-const crawlMerchantSite = async (url) => {
+const crawlMerchantSite = async (url, backendUrl) => {
   if (!url?.trim()) return "";
   try {
-    const proxy = `https://api.allorigins.win/get?url=${encodeURIComponent(url.trim())}&t=${Date.now()}`;
-    const res = await fetch(proxy);
-    if (!res.ok) throw new Error("Proxy error");
+    const res = await fetch(
+      `${backendUrl}/api/seo/crawl?url=${encodeURIComponent(url.trim())}`,
+      { signal: AbortSignal.timeout(15000) }
+    );
+    if (!res.ok) throw new Error(`Crawl proxy ${res.status}`);
     const data = await res.json();
-    const html = data.contents || "";
-    const parser = new DOMParser();
-    const doc = parser.parseFromString(html, "text/html");
-    doc.querySelectorAll("script,style,noscript,svg,header,footer,nav,aside,.ad,.cookie,.banner").forEach((el) => el.remove());
-    let rawText = (doc.body.innerText || "").replace(/\s+/g, " ").trim().substring(0, 11000);
-    return rawText.length > 100 ? rawText : "No substantial content found on homepage.";
+    return data.text || "";
   } catch (err) {
     console.warn("Crawl failed:", err.message);
-    return `CRAWL FAILED for ${url}. Falling back to DB + general knowledge.`;
+    return `CRAWL FAILED for ${url}`;
   }
 };
 
@@ -625,7 +622,7 @@ export default function VariationEngine() {
     if (url?.trim()) {
       setCrawlStatus("loading");
       setStatus("Crawling merchant website…");
-      crawledText = await crawlMerchantSite(url);
+      crawledText = await crawlMerchantSite(url, backendUrl);
       setCrawlStatus(crawledText.length > 200 ? "success" : "failed");
     }
 
@@ -688,7 +685,7 @@ export default function VariationEngine() {
         dbData = await fetchMerchantData(r.slug, backendUrl);
       }
       if (r.url) {
-        crawledText = await crawlMerchantSite(r.url);
+        crawledText = await crawlMerchantSite(r.url, backendUrl);
       }
 
       try {
