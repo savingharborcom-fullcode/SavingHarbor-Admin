@@ -1598,6 +1598,7 @@ export default function VariationEngine() {
   const [dbStatus, setDbStatus] = useState("idle");
   const [crawlStatus, setCrawlStatus] = useState("idle");
   const [saveStatus, setSaveStatus] = useState("idle");
+  const [forceRegenerate, setForceRegenerate] = useState(false);
   const [output, setOutput] = useState(null);
   const [preview, setPreview] = useState(null);
   const [tab, setTab] = useState("seo");
@@ -1654,6 +1655,15 @@ export default function VariationEngine() {
       setStatus("Fetching real coupon data from DB…");
       dbData = await fetchMerchantData(merchantSlug, backendUrl);
       setDbStatus(dbData ? "connected" : "failed");
+    }
+
+    // Skip if already generated unless forced
+    if (dbData?.contentGenerated && !forceRegenerate) {
+      setError(
+        "Content already generated for this store. Enable 'Force Regenerate' to overwrite.",
+      );
+      setRunning(false);
+      return;
     }
 
     if (url?.trim()) {
@@ -1784,6 +1794,12 @@ export default function VariationEngine() {
     let crawledText = "";
 
     if (useDB && r.slug) dbData = await fetchMerchantData(r.slug, backendUrl);
+
+    // Skip if already generated
+    if (dbData?.contentGenerated) {
+      return { skipped: true };
+    }
+
     if (r.url) crawledText = await crawlMerchantSite(r.url, backendUrl);
 
     const researchRaw = await callWithRetry(
@@ -1846,7 +1862,7 @@ export default function VariationEngine() {
     setRunning(true);
     setBatchTotal(rows.length);
 
-    const RPM_DELAY = 1200; // 15 RPM = 1 per 4s — use 4.2s for safety margin
+    const RPM_DELAY = 4200; // 15 RPM = 1 per 4s — use 4.2s for safety margin
 
     for (let i = 0; i < rows.length; i++) {
       if (stopRef.current) break;
@@ -1857,18 +1873,30 @@ export default function VariationEngine() {
 
       try {
         const result = await processStore(r, keyEntry);
-        setBatchResults((prev) => [
-          ...prev,
-          {
-            merchant: r.name,
-            category: r.category,
-            slug: r.slug,
-            status: "done",
-            saved: result.savedOk,
-            keyUsed: keyEntry.i + 1,
-            ...result,
-          },
-        ]);
+        if (result.skipped) {
+          setBatchResults((prev) => [
+            ...prev,
+            {
+              merchant: r.name,
+              category: r.category,
+              slug: r.slug,
+              status: "skipped",
+            },
+          ]);
+        } else {
+          setBatchResults((prev) => [
+            ...prev,
+            {
+              merchant: r.name,
+              category: r.category,
+              slug: r.slug,
+              status: "done",
+              saved: result.savedOk,
+              keyUsed: keyEntry.i + 1,
+              ...result,
+            },
+          ]);
+        }
       } catch (e) {
         setBatchResults((prev) => [
           ...prev,
@@ -3203,10 +3231,19 @@ export default function VariationEngine() {
                   >
                     <span
                       style={{
-                        color: r.status === "done" ? "#2E5C0E" : "#993C1D",
+                        color:
+                          r.status === "done"
+                            ? "#2E5C0E"
+                            : r.status === "skipped"
+                              ? "#6c757d"
+                              : "#993C1D",
                       }}
                     >
-                      {r.status === "done" ? "✓" : "✗"}
+                      {r.status === "done"
+                        ? "✓"
+                        : r.status === "skipped"
+                          ? "⏭"
+                          : "✗"}
                     </span>
                     <span style={{ flex: 1, fontWeight: 500 }}>
                       {r.merchant}
@@ -3230,7 +3267,20 @@ export default function VariationEngine() {
                           r.variation?.tone?.label
                         : r.error}
                     </span>
-                    {r.keyUsed && (
+                    {r.status === "skipped" && (
+                      <span
+                        style={{
+                          fontSize: 10,
+                          padding: "1px 6px",
+                          background: "#f0f0f0",
+                          color: "#6c757d",
+                          borderRadius: 3,
+                        }}
+                      >
+                        Already done
+                      </span>
+                    )}
+                    {r.keyUsed && r.status !== "skipped" && (
                       <span
                         style={{
                           fontSize: 10,

@@ -19,7 +19,7 @@ router.get("/merchant-data", async (req, res) => {
     // 1. Merchant
     const { data: merchant, error: mErr } = await supabase
       .from("merchants")
-      .select("id, name, web_url, category_id, active_coupons_count")
+      .select("id, name, web_url, category_id, active_coupons_count, content_generated")
       .eq("slug", slug)
       .single();
 
@@ -79,6 +79,7 @@ router.get("/merchant-data", async (req, res) => {
       category: categoryRow?.name || null,
       totalCoupons: activeCoupons.filter((c) => c.coupon_type === "coupon").length,
       totalDeals: activeCoupons.filter((c) => c.coupon_type === "deal").length,
+      contentGenerated: merchant.content_generated,
       maxDiscount,       // highest % off
       avgDiscount,       // avg % off
       maxFlatDiscount: maxFlat,
