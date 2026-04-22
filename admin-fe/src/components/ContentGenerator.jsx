@@ -1,13 +1,15 @@
 /**
- * SavingHarbor — Content Architecture Variation Engine v2.3
- * Changes from v2.2:
- * - Multi-key round-robin for batch — up to 10 Gemini keys, one key per store
- * - Key rotation UI in config panel
- * - Per-key usage counter displayed live during batch
- * - On 429, auto-rotates to next available key and retries once
+ * SavingHarbor — Content Architecture Variation Engine v2.4
+ * Changes from v2.3:
+ * - Worker-pool batch: N keys → N concurrent workers, zero idle time
+ * - Smarter backoff: exponential 10s*2^attempt ±2s jitter (was flat 45s)
+ * - Removed preemptive 1200ms RPM_DELAY — backoff only on real errors
+ * - stopRef checked inside each worker (immediate halt, not end-of-store)
+ * - Live per-worker status display (which key is on which store)
+ * - batchIdx incremented via ref (race-safe across concurrent workers)
  */
 
-import { useState, useRef } from "react";
+import { useState, useRef, useCallback } from "react";
 
 const BACKEND_URL = "https://admin-api.savingharbor.com";
 
@@ -55,7 +57,7 @@ function safeJSON(text) {
   return JSON.parse(clean.replace(/,(\s*[}\]])/g, "$1"));
 }
 
-// ─── DISCOUNT SUMMARY (built from scratch) ────────────────────────
+// ─── DISCOUNT SUMMARY ─────────────────────────────────────────────
 function formatDiscount(c) {
   if (!c) return null;
   if (c.discountType === "percent" && c.value) return `${c.value}% off`;
@@ -66,7 +68,6 @@ function formatDiscount(c) {
 
 function buildDiscountSummary(dbData) {
   if (!dbData) return null;
-
   const {
     totalCoupons = 0,
     totalDeals = 0,
@@ -78,10 +79,7 @@ function buildDiscountSummary(dbData) {
     coupons = [],
     name,
   } = dbData;
-
-  // Top offers — pick up to 4 most meaningful
   const topOffers = coupons.slice(0, 4).map(formatDiscount).filter(Boolean);
-
   const lines = [];
   if (maxDiscount) lines.push(`Top discount: ${maxDiscount}% off`);
   if (avgDiscount) lines.push(`Average saving: ${avgDiscount}% off`);
@@ -91,7 +89,6 @@ function buildDiscountSummary(dbData) {
   if (hasNewUserOffer) lines.push("New customer / first order offer available");
   if (couponTypes.length) lines.push(`Offer types: ${couponTypes.join(", ")}`);
   if (topOffers.length) lines.push(`Top offers: ${topOffers.join(" | ")}`);
-
   return {
     summary: lines.join("\n"),
     maxDiscount,
@@ -106,7 +103,7 @@ function buildDiscountSummary(dbData) {
   };
 }
 
-// ─── VARIATION ENGINE (unchanged logic) ───────────────────────────
+// ─── VARIATION ENGINE ─────────────────────────────────────────────
 function stableHash(str) {
   let h = 2166136261;
   for (let i = 0; i < str.length; i++) {
@@ -993,7 +990,6 @@ function buildHeading(section, merchant, headingStyleId) {
   return base;
 }
 
-// FAQ question type pools — assigned per store, forces different question angles
 const FAQ_QUESTION_TYPES = [
   {
     id: "savings",
@@ -1059,14 +1055,9 @@ const FAQ_QUESTION_TYPES = [
 
 function getVariation(merchantName, category) {
   const h = stableHash(merchantName + "|" + category);
-  // secondaryHash mixes in blueprint + tone index to spread same-category stores further apart
   const h2 = stableHash(merchantName + "|" + category + "|v2");
   const bp = detectBlueprint(category);
-
-  // FAQ count: 5-8 per store, deterministic
   const faqCount = 5 + (h2 % 4);
-
-  // Pick faqCount question types from pool, unique per store
   const faqTypes = [];
   for (let i = 0; i < faqCount; i++) {
     const idx = (h2 >> (i * 4)) % FAQ_QUESTION_TYPES.length;
@@ -1077,7 +1068,6 @@ function getVariation(merchantName, category) {
         FAQ_QUESTION_TYPES[(idx + i + 1) % FAQ_QUESTION_TYPES.length],
       );
   }
-
   return {
     blueprint: bp,
     tone: TONES[h % 4],
@@ -1092,7 +1082,7 @@ function getVariation(merchantName, category) {
   };
 }
 
-// ─── DB FETCH ─────────────────────────────────────────────────────
+// ─── DB / API HELPERS ─────────────────────────────────────────────
 async function fetchMerchantData(merchantSlug, backendUrl) {
   if (!merchantSlug) return null;
   try {
@@ -1108,7 +1098,6 @@ async function fetchMerchantData(merchantSlug, backendUrl) {
   }
 }
 
-// ─── PENDING MERCHANTS ───────────────────────────────────────────
 async function fetchPendingMerchants(backendUrl) {
   try {
     const res = await fetch(`${backendUrl}/api/seo/pending-merchants`, {
@@ -1122,7 +1111,6 @@ async function fetchPendingMerchants(backendUrl) {
   }
 }
 
-// ─── DB SAVE ──────────────────────────────────────────────────────
 async function saveContentToDB(slug, content, backendUrl) {
   if (!slug) return { skipped: true, reason: "no slug" };
   try {
@@ -1143,13 +1131,12 @@ async function saveContentToDB(slug, content, backendUrl) {
   }
 }
 
-// ─── RESEARCH PROMPT ──────────────────────────────────────────────
+// ─── PROMPTS ──────────────────────────────────────────────────────
 function buildResearchPrompt(merchantName, category, url, crawledText, dbData) {
   const ds = buildDiscountSummary(dbData);
   const dbPart = ds
     ? `REAL DB COUPON DATA:\n${ds.summary}\n\nTop individual offers:\n${ds.topOffers.map((o, i) => `${i + 1}. ${o}`).join("\n")}`
     : "";
-
   return `You are an expert SEO researcher for SavingHarbor.com.
 
 Merchant: "${merchantName}" | Category: "${category}"
@@ -1168,7 +1155,6 @@ Return ONLY valid JSON — no preamble, no markdown fences:
 }`;
 }
 
-// ─── FINAL CONTENT PROMPT (all 5 fixes applied) ───────────────────
 function buildFinalPrompt(
   merchantName,
   category,
@@ -1179,8 +1165,6 @@ function buildFinalPrompt(
 ) {
   const { blueprint, tone, angle, headingStyle, sectionDepths } = variation;
   const ds = buildDiscountSummary(dbData);
-
-  // DB facts block — concrete numbers force unique, non-templated output
   const dbFacts = ds
     ? `
 LIVE STORE STATS (mandatory — weave these into content naturally):
@@ -1314,6 +1298,29 @@ ${sectionInstructions}
   "variationProfile": "${blueprint.label} | ${tone.label} | ${angle.label} | ${headingStyle.label}"
 }`;
 }
+
+// ─── CONTENT FORMATTERS ───────────────────────────────────────────
+const sectionsToHtml = (sections) => {
+  if (!sections) return "";
+  return Object.values(sections)
+    .map((s) => {
+      const heading = typeof s === "object" ? s.heading : "";
+      const body = typeof s === "object" ? s.body : s;
+      return `${heading ? `<h2>${heading}</h2>` : ""}<p>${(body || "").replace(/\n/g, "</p><p>")}</p>`;
+    })
+    .join("\n");
+};
+
+const buildH2Blocks = (sections) => {
+  if (!sections) return [];
+  return Object.entries(sections).map(([key, s]) => ({
+    id: key,
+    heading: typeof s === "object" ? s.heading : key,
+    body: typeof s === "object" ? s.body : s,
+  }));
+};
+
+const buildH3Blocks = () => [];
 
 // ─── UI COMPONENTS ────────────────────────────────────────────────
 function CopyBtn({ text, label = "Copy" }) {
@@ -1550,8 +1557,7 @@ function DBStatus({ status }) {
       text: "○ DB not fetched",
     },
   };
-  const s = map[status] || map.idle;
-  return <StatusBadge {...s} />;
+  return <StatusBadge {...(map[status] || map.idle)} />;
 }
 
 function CrawlStatus({ status }) {
@@ -1561,8 +1567,7 @@ function CrawlStatus({ status }) {
     failed: { bg: "#FAEEDA", color: "#854F0B", text: "⚠ Crawl fallback" },
     idle: { bg: "#f8f9fa", color: "#6c757d", text: "No crawl" },
   };
-  const s = map[status] || map.idle;
-  return <StatusBadge {...s} />;
+  return <StatusBadge {...(map[status] || map.idle)} />;
 }
 
 function SaveStatus({ status }) {
@@ -1572,20 +1577,125 @@ function SaveStatus({ status }) {
     failed: { bg: "#FAECE7", color: "#993C1D", text: "✗ Save failed" },
     skipped: { bg: "#f8f9fa", color: "#6c757d", text: "— Not saved (no slug)" },
   };
-  const s = map[status] || map.skipped;
-  return <StatusBadge {...s} />;
+  return <StatusBadge {...(map[status] || map.skipped)} />;
+}
+
+// ─── WORKER STATUS PANEL (new) ────────────────────────────────────
+function WorkerPanel({ workers }) {
+  // workers: { [keyIdx]: { store, stage, status } }
+  const entries = Object.entries(workers);
+  if (!entries.length) return null;
+  return (
+    <div
+      style={{
+        border: "0.5px solid var(--color-border-tertiary)",
+        borderRadius: 8,
+        overflow: "hidden",
+        marginBottom: "0.9rem",
+      }}
+    >
+      <div
+        style={{
+          background: "var(--color-background-secondary)",
+          padding: "6px 12px",
+          fontSize: 11,
+          fontWeight: 500,
+          color: "var(--color-text-secondary)",
+        }}
+      >
+        Worker Pool — {entries.length} keys active
+      </div>
+      {entries.map(([ki, w]) => (
+        <div
+          key={ki}
+          style={{
+            padding: "6px 12px",
+            borderTop: "0.5px solid var(--color-border-tertiary)",
+            display: "flex",
+            alignItems: "center",
+            gap: 10,
+            fontSize: 12,
+          }}
+        >
+          <span
+            style={{
+              width: 38,
+              flexShrink: 0,
+              color: "var(--color-text-tertiary)",
+              fontFamily: "var(--font-mono)",
+              fontSize: 11,
+            }}
+          >
+            K{parseInt(ki) + 1}
+          </span>
+          <span
+            style={{
+              flex: 1,
+              fontWeight: 500,
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
+            }}
+          >
+            {w.store || "—"}
+          </span>
+          <span
+            style={{
+              fontSize: 10,
+              padding: "1px 7px",
+              borderRadius: 3,
+              whiteSpace: "nowrap",
+              background:
+                w.status === "idle"
+                  ? "#f0f0f0"
+                  : w.status === "error"
+                    ? "#FAECE7"
+                    : w.status === "done"
+                      ? "#EAF3DE"
+                      : "#E6F1FB",
+              color:
+                w.status === "idle"
+                  ? "#6c757d"
+                  : w.status === "error"
+                    ? "#993C1D"
+                    : w.status === "done"
+                      ? "#2E5C0E"
+                      : "#185FA5",
+            }}
+          >
+            {w.stage || w.status}
+          </span>
+          {w.retrying && (
+            <span
+              style={{
+                fontSize: 10,
+                padding: "1px 7px",
+                borderRadius: 3,
+                background: "#FFF3CD",
+                color: "#856404",
+              }}
+            >
+              retry {w.retryAttempt}/3
+            </span>
+          )}
+        </div>
+      ))}
+    </div>
+  );
 }
 
 // ─── MAIN COMPONENT ───────────────────────────────────────────────
 export default function VariationEngine() {
-  const [apiKey, setApiKey] = useState(""); // used for single mode
-  const [apiKeys, setApiKeys] = useState([""]); // used for batch mode round-robin
+  const [apiKey, setApiKey] = useState("");
+  const [apiKeys, setApiKeys] = useState([""]);
   const [backendUrl, setBackendUrl] = useState(BACKEND_URL);
-  const [model, setModel] = useState("gemini-3.1-flash-lite");
+  const [model, setModel] = useState("gemini-3.1-flash-lite-preview");
   const [useDB, setUseDB] = useState(true);
-  const [keyUsage, setKeyUsage] = useState({}); // { keyIndex: callCount }
-  const keyIdxRef = useRef(0); // current round-robin pointer
-  const deniedKeysRef = useRef(new Set()); // keys permanently removed from rotation
+  const [keyUsage, setKeyUsage] = useState({});
+
+  // Worker pool state (new)
+  const [workerStates, setWorkerStates] = useState({}); // { keyIdx: { store, stage, status, retrying, retryAttempt } }
+  const deniedKeysRef = useRef(new Set());
 
   const [merchant, setMerchant] = useState("");
   const [category, setCategory] = useState("");
@@ -1606,9 +1716,25 @@ export default function VariationEngine() {
 
   const [batchText, setBatchText] = useState("");
   const [batchResults, setBatchResults] = useState([]);
-  const [batchIdx, setBatchIdx] = useState(0);
+  const [batchDone, setBatchDone] = useState(0);
   const [batchTotal, setBatchTotal] = useState(0);
   const stopRef = useRef(false);
+
+  // ── Helpers ──
+  const updateWorker = useCallback((keyIdx, patch) => {
+    setWorkerStates((prev) => ({
+      ...prev,
+      [keyIdx]: { ...(prev[keyIdx] || {}), ...patch },
+    }));
+  }, []);
+
+  const clearWorker = useCallback((keyIdx) => {
+    setWorkerStates((prev) => {
+      const next = { ...prev };
+      delete next[keyIdx];
+      return next;
+    });
+  }, []);
 
   const showPreview = () => {
     if (!merchant || !category) {
@@ -1635,7 +1761,7 @@ export default function VariationEngine() {
       })
       .filter((r) => r.name);
 
-  // ── Single generate + save ──
+  // ── Single generate ──
   const runSingle = async () => {
     if (!apiKey || !merchant || !category) {
       setError("Gemini API key, merchant name and category are required.");
@@ -1647,18 +1773,14 @@ export default function VariationEngine() {
     setDbStatus("idle");
     setCrawlStatus("idle");
     setSaveStatus("idle");
-
-    let dbData = null;
-    let crawledText = "";
-
+    let dbData = null,
+      crawledText = "";
     if (useDB && merchantSlug) {
       setDbStatus("loading");
       setStatus("Fetching real coupon data from DB…");
       dbData = await fetchMerchantData(merchantSlug, backendUrl);
       setDbStatus(dbData ? "connected" : "failed");
     }
-
-    // Skip if already generated unless forced
     if (dbData?.contentGenerated && !forceRegenerate) {
       setError(
         "Content already generated for this store. Enable 'Force Regenerate' to overwrite.",
@@ -1666,28 +1788,28 @@ export default function VariationEngine() {
       setRunning(false);
       return;
     }
-
     if (url?.trim()) {
       setCrawlStatus("loading");
       setStatus("Crawling merchant website…");
       crawledText = await crawlMerchantSite(url, backendUrl);
       setCrawlStatus(crawledText.length > 200 ? "success" : "failed");
     }
-
     try {
       setStatus("Stage 1 — deep research…");
       const research = safeJSON(
-        await callGemini(
+        await callGeminiWithBackoff(
           buildResearchPrompt(merchant, category, url, crawledText, dbData),
           apiKey,
           model,
+          0,
+          null,
+          null,
         ),
       );
-
       const variation = getVariation(merchant, category);
       setStatus("Stage 2 — generating content…");
       const data = safeJSON(
-        await callGemini(
+        await callGeminiWithBackoff(
           buildFinalPrompt(
             merchant,
             category,
@@ -1698,9 +1820,11 @@ export default function VariationEngine() {
           ),
           apiKey,
           model,
+          0,
+          null,
+          null,
         ),
       );
-
       const result = {
         ...data,
         variation,
@@ -1710,8 +1834,6 @@ export default function VariationEngine() {
       };
       setOutput(result);
       setTab("seo");
-
-      // Save to DB
       if (merchantSlug) {
         setSaveStatus("saving");
         setStatus("Saving content to DB…");
@@ -1725,7 +1847,7 @@ export default function VariationEngine() {
             description_html: sectionsToHtml(data.sections),
             faqs: data.faqItems || [],
             coupon_h2_blocks: buildH2Blocks(data.sections),
-            coupon_h3_blocks: buildH3Blocks(data.sections),
+            coupon_h3_blocks: buildH3Blocks(),
           },
           backendUrl,
         );
@@ -1733,7 +1855,6 @@ export default function VariationEngine() {
       } else {
         setSaveStatus("skipped");
       }
-
       setStatus("Complete");
     } catch (e) {
       setError(e.message || "Generation failed");
@@ -1741,29 +1862,23 @@ export default function VariationEngine() {
     setRunning(false);
   };
 
-  // ── Round-robin key picker ──
-  const getNextKey = () => {
-    const valid = apiKeys
-      .map((k, i) => ({ k: k.trim(), i }))
-      .filter((x) => x.k && !deniedKeysRef.current.has(x.i));
-    if (!valid.length) return null;
-    const pick = valid[keyIdxRef.current % valid.length];
-    keyIdxRef.current = (keyIdxRef.current + 1) % valid.length;
-    return pick;
-  };
-
-  // ── Gemini call with retry + key rotation ──
-  const callWithRetry = async (prompt, keyEntry, attempt = 0) => {
+  // ─── BACKOFF (replaces callWithRetry — no key rotation args needed externally) ───
+  // keyEntry: { k: string, i: number }
+  // onRetry: optional callback(attempt, waitMs) for UI updates
+  // onKeyDenied: optional callback(keyIdx)
+  const callGeminiWithBackoff = async (
+    prompt,
+    apiKeyStr,
+    modelStr,
+    attempt = 0,
+    onRetry,
+    onKeyDenied,
+  ) => {
     try {
-      const result = await callGemini(prompt, keyEntry.k, model);
-      setKeyUsage((prev) => ({
-        ...prev,
-        [`key${keyEntry.i}`]: (prev[`key${keyEntry.i}`] || 0) + 1,
-      }));
-      return result;
+      return await callGemini(prompt, apiKeyStr, modelStr);
     } catch (e) {
-      const msg = e.message?.toLowerCase() || "";
-      const isQuota = e.message?.includes("429") || msg.includes("quota");
+      const msg = (e.message || "").toLowerCase();
+      const is429 = e.message?.includes("429") || msg.includes("quota");
       const isHighLoad =
         msg.includes("high demand") ||
         msg.includes("high load") ||
@@ -1771,75 +1886,98 @@ export default function VariationEngine() {
       const isDenied =
         msg.includes("denied access") ||
         msg.includes("project has been denied");
-      const isRetryable =
-        (isQuota ||
-          isHighLoad ||
-          e.message?.includes("500") ||
-          e.message?.includes("503")) &&
-        !isDenied;
+      const isServer = e.message?.includes("500") || e.message?.includes("503");
+      const isRetryable = (is429 || isHighLoad || isServer) && !isDenied;
 
       if (isDenied) {
-        deniedKeysRef.current.add(keyEntry.i);
-        throw new Error(
-          `Key ${keyEntry.i + 1} denied access — removed from rotation`,
-        );
+        onKeyDenied?.();
+        throw new Error(`Key denied access — removed from rotation`);
       }
-
       if (isRetryable && attempt < 3) {
-        let nextKey = keyEntry;
-        if (isQuota) {
-          const rotated = getNextKey();
-          if (rotated && rotated.i !== keyEntry.i) {
-            console.warn(
-              `Key ${keyEntry.i + 1} quota — rotating to key ${rotated.i + 1}`,
-            );
-            nextKey = rotated;
-          }
-        }
-        const wait = isHighLoad
-          ? 45000
-          : isQuota
-            ? 30000
-            : (attempt + 1) * 5000;
-        setStatus(
-          `Retry ${attempt + 1}/3 — ${isHighLoad ? "model high load" : isQuota ? "quota" : "server error"} — waiting ${wait / 1000}s…`,
-        );
+        // Exponential backoff: 10s, 20s, 40s ± up to 2s jitter
+        const base = is429 ? 30000 : isHighLoad ? 10000 : 5000;
+        const exp = base * Math.pow(2, attempt);
+        const jitter = Math.floor(Math.random() * 4000) - 2000; // ±2s
+        const wait = Math.max(3000, exp + jitter);
+        onRetry?.(attempt + 1, wait);
         await new Promise((res) => setTimeout(res, wait));
-        return callWithRetry(prompt, nextKey, attempt + 1);
+        return callGeminiWithBackoff(
+          prompt,
+          apiKeyStr,
+          modelStr,
+          attempt + 1,
+          onRetry,
+          onKeyDenied,
+        );
       }
       throw e;
     }
   };
 
-  // ── Process one store ──
+  // ─── PROCESS ONE STORE (used by both single worker and retry) ───
   const processStore = async (r, keyEntry) => {
-    let dbData = null;
-    let crawledText = "";
-
+    let dbData = null,
+      crawledText = "";
     if (useDB && r.slug) dbData = await fetchMerchantData(r.slug, backendUrl);
-
-    // Skip if already generated
-    if (dbData?.contentGenerated) {
-      return { skipped: true };
-    }
-
+    if (dbData?.contentGenerated) return { skipped: true };
     if (r.url) crawledText = await crawlMerchantSite(r.url, backendUrl);
 
-    const researchRaw = await callWithRetry(
+    const onRetry = (attempt, waitMs) => {
+      updateWorker(keyEntry.i, {
+        retrying: true,
+        retryAttempt: attempt,
+        stage: `retry ${attempt}/3 — ${Math.round(waitMs / 1000)}s`,
+      });
+    };
+    const onKeyDenied = () => {
+      deniedKeysRef.current.add(keyEntry.i);
+      clearWorker(keyEntry.i);
+    };
+
+    updateWorker(keyEntry.i, {
+      store: r.name,
+      stage: "research",
+      status: "running",
+      retrying: false,
+    });
+    const researchRaw = await callGeminiWithBackoff(
       buildResearchPrompt(r.name, r.category, r.url, crawledText, dbData),
-      keyEntry,
+      keyEntry.k,
+      model,
+      0,
+      onRetry,
+      onKeyDenied,
     );
     const research = safeJSON(researchRaw);
 
+    // Check stop between the two stages — earliest safe exit point
+    if (stopRef.current) throw new Error("STOPPED");
+
+    updateWorker(keyEntry.i, {
+      store: r.name,
+      stage: "content",
+      status: "running",
+      retrying: false,
+    });
     const variation = getVariation(r.name, r.category);
-    const dataRaw = await callWithRetry(
+    const dataRaw = await callGeminiWithBackoff(
       buildFinalPrompt(r.name, r.category, research, variation, dbData, r.url),
-      keyEntry,
+      keyEntry.k,
+      model,
+      0,
+      onRetry,
+      onKeyDenied,
     );
     const data = safeJSON(dataRaw);
 
+    setKeyUsage((prev) => ({
+      ...prev,
+      [`key${keyEntry.i}`]: (prev[`key${keyEntry.i}`] || 0) + 2,
+    }));
+
     let savedOk = null;
     if (r.slug) {
+      updateWorker(keyEntry.i, { stage: "saving" });
       const saveResult = await saveContentToDB(
         r.slug,
         {
@@ -1850,7 +1988,7 @@ export default function VariationEngine() {
           description_html: sectionsToHtml(data.sections),
           faqs: data.faqItems || [],
           coupon_h2_blocks: buildH2Blocks(data.sections),
-          coupon_h3_blocks: buildH3Blocks(data.sections),
+          coupon_h3_blocks: buildH3Blocks(),
         },
         backendUrl,
       );
@@ -1860,13 +1998,17 @@ export default function VariationEngine() {
     return { ...data, variation, dbData, savedOk };
   };
 
-  // ── Batch generate + save ──
+  // ─── WORKER POOL BATCH (replaces serial for-loop) ────────────────
   const runBatch = async (rowsOverride = null) => {
-    const validKeys = apiKeys.map((k) => k.trim()).filter(Boolean);
+    const validKeys = apiKeys
+      .map((k, i) => ({ k: k.trim(), i }))
+      .filter((x) => x.k);
+
     if (!validKeys.length) {
       setError("Add at least one Gemini API key for batch.");
       return;
     }
+
     const rows = rowsOverride || parseBatch(batchText);
     if (!rows.length) {
       setError(
@@ -1878,69 +2020,130 @@ export default function VariationEngine() {
     if (!rowsOverride) {
       setError("");
       setBatchResults([]);
-      keyIdxRef.current = 0;
+      setBatchDone(0);
       setKeyUsage({});
+      setWorkerStates({});
       deniedKeysRef.current = new Set();
     }
+
     stopRef.current = false;
     setRunning(true);
     setBatchTotal(rows.length);
 
-    const RPM_DELAY = 1200;
+    // Shared queue — index pointer advanced atomically via closure
+    // JS is single-threaded so no true race on this counter
+    let queueIdx = 0;
+    const getNextRow = () => {
+      if (queueIdx >= rows.length) return null;
+      return rows[queueIdx++];
+    };
 
-    for (let i = 0; i < rows.length; i++) {
-      if (stopRef.current) break;
-      const r = rows[i];
-      setBatchIdx(i + 1);
-      const keyEntry = getNextKey();
-      setStatus(`[${i + 1}/${rows.length}] ${r.name} — key ${keyEntry.i + 1}`);
-
-      try {
-        const result = await processStore(r, keyEntry);
-        if (result.skipped) {
-          setBatchResults((prev) => [
-            ...prev,
-            {
-              merchant: r.name,
-              category: r.category,
-              slug: r.slug,
-              status: "skipped",
-            },
-          ]);
-        } else {
-          setBatchResults((prev) => [
-            ...prev,
-            {
-              merchant: r.name,
-              category: r.category,
-              slug: r.slug,
-              status: "done",
-              saved: result.savedOk,
-              keyUsed: keyEntry.i + 1,
-              ...result,
-            },
-          ]);
+    // One async worker per key
+    const runWorker = async (keyEntry) => {
+      while (true) {
+        // Stop check at top of every iteration
+        if (stopRef.current) {
+          clearWorker(keyEntry.i);
+          break;
         }
-      } catch (e) {
-        setBatchResults((prev) => [
-          ...prev,
-          {
-            merchant: r.name,
-            category: r.category,
-            url: r.url,
-            slug: r.slug,
-            status: "error",
-            error: e.message,
-            keyUsed: keyEntry.i + 1,
-          },
-        ]);
-      }
 
-      if (i < rows.length - 1)
-        await new Promise((res) => setTimeout(res, RPM_DELAY));
-    }
+        // Deny check — key may have been denied mid-batch
+        if (deniedKeysRef.current.has(keyEntry.i)) {
+          clearWorker(keyEntry.i);
+          break;
+        }
+
+        const row = getNextRow();
+        if (!row) {
+          clearWorker(keyEntry.i);
+          break;
+        } // queue exhausted
+
+        updateWorker(keyEntry.i, {
+          store: row.name,
+          stage: "starting",
+          status: "running",
+          retrying: false,
+        });
+
+        try {
+          const result = await processStore(row, keyEntry);
+
+          if (stopRef.current) {
+            // Store finished but stop was requested — still record result, then exit
+            if (!result.skipped) {
+              setBatchResults((prev) => [
+                ...prev,
+                {
+                  merchant: row.name,
+                  category: row.category,
+                  slug: row.slug,
+                  status: "done",
+                  saved: result.savedOk,
+                  keyUsed: keyEntry.i + 1,
+                  ...result,
+                },
+              ]);
+            }
+            clearWorker(keyEntry.i);
+            break;
+          }
+
+          setBatchResults((prev) => [
+            ...prev,
+            result.skipped
+              ? {
+                  merchant: row.name,
+                  category: row.category,
+                  slug: row.slug,
+                  status: "skipped",
+                }
+              : {
+                  merchant: row.name,
+                  category: row.category,
+                  slug: row.slug,
+                  status: "done",
+                  saved: result.savedOk,
+                  keyUsed: keyEntry.i + 1,
+                  ...result,
+                },
+          ]);
+          setBatchDone((prev) => prev + 1);
+          updateWorker(keyEntry.i, { stage: "done", status: "done" });
+        } catch (e) {
+          if (e.message === "STOPPED") {
+            clearWorker(keyEntry.i);
+            break;
+          }
+
+          setBatchResults((prev) => [
+            ...prev,
+            {
+              merchant: row.name,
+              category: row.category,
+              url: row.url,
+              slug: row.slug,
+              status: "error",
+              error: e.message,
+              keyUsed: keyEntry.i + 1,
+            },
+          ]);
+          setBatchDone((prev) => prev + 1);
+          updateWorker(keyEntry.i, { stage: "error", status: "error" });
+
+          // Brief pause after an error before this worker picks up the next store
+          // Prevents hammering if something systemic is wrong
+          if (!stopRef.current)
+            await new Promise((res) => setTimeout(res, 2000));
+        }
+      }
+    };
+
+    // Launch all workers concurrently — one per valid key
+    await Promise.allSettled(validKeys.map((keyEntry) => runWorker(keyEntry)));
 
     setRunning(false);
+    setWorkerStates({});
     setStatus(stopRef.current ? "Stopped." : "Batch complete.");
   };
 
@@ -1954,12 +2157,11 @@ export default function VariationEngine() {
       url: r.url || "",
       slug: r.slug || "",
     }));
-    // Remove failed entries from results so they get fresh slots
     setBatchResults((prev) => prev.filter((r) => r.status !== "error"));
     runBatch(rows);
   };
 
-  // ── Load pending stores from DB ──
+  // ── Load pending ──
   const loadPending = async () => {
     setStatus("Loading pending stores from DB…");
     const data = await fetchPendingMerchants(backendUrl);
@@ -1976,32 +2178,6 @@ export default function VariationEngine() {
       .join("\n");
     setBatchText(csv);
     setStatus(`Loaded ${data.merchants.length} pending stores.`);
-  };
-
-  // ── Content formatters for DB save ──
-  const sectionsToHtml = (sections) => {
-    if (!sections) return "";
-    return Object.values(sections)
-      .map((s) => {
-        const heading = typeof s === "object" ? s.heading : "";
-        const body = typeof s === "object" ? s.body : s;
-        return `${heading ? `<h2>${heading}</h2>` : ""}<p>${(body || "").replace(/\n/g, "</p><p>")}</p>`;
-      })
-      .join("\n");
-  };
-
-  const buildH2Blocks = (sections) => {
-    if (!sections) return [];
-    return Object.entries(sections).map(([key, s]) => ({
-      id: key,
-      heading: typeof s === "object" ? s.heading : key,
-      body: typeof s === "object" ? s.body : s,
-    }));
-  };
-
-  const buildH3Blocks = (sections) => {
-    // H3 blocks = FAQ formatted as sub-headings; extend as needed
-    return [];
   };
 
   // ── Exports ──
@@ -2100,8 +2276,7 @@ export default function VariationEngine() {
     : "";
   const wordCount = allContent.split(/\s+/).filter(Boolean).length;
   const batchRows = parseBatch(batchText);
-  const estCost = (n) =>
-    (n * (model.includes("flash") ? 0.004 : 0.036)).toFixed(2); // 2-stage = 2x calls
+  const activeWorkerCount = Object.keys(workerStates).length;
 
   const inputStyle = {
     width: "100%",
@@ -2147,11 +2322,11 @@ export default function VariationEngine() {
         }}
       >
         ⚡ SavingHarbor Variation Engine{" "}
-        <strong>v2.2 — DB Save + LSI Injection</strong>
+        <strong>v2.4 — Worker Pool + Smart Backoff</strong>
         <br />
         <span style={{ fontSize: 12 }}>
-          384 variations · Live crawl · Real DB coupons · Auto-save to merchants
-          table
+          384 variations · Live crawl · Real DB coupons · N-key parallel workers
+          · Exponential backoff
         </span>
       </div>
 
@@ -2189,7 +2364,6 @@ export default function VariationEngine() {
           Configuration
         </div>
 
-        {/* Single mode — one key */}
         {mode === "single" && (
           <div
             style={{
@@ -2238,9 +2412,6 @@ export default function VariationEngine() {
                 style={{ ...inputStyle, height: 36 }}
                 disabled={running}
               >
-                <option value="gemini-3.1-flash-lite">
-                  gemini-3.1-flash-lite
-                </option>
                 <option value="gemini-3.1-flash-lite-preview">
                   gemini-3.1-flash-lite-preview (500 RPD)
                 </option>
@@ -2255,7 +2426,6 @@ export default function VariationEngine() {
           </div>
         )}
 
-        {/* Batch mode — multi-key round-robin */}
         {mode === "batch" && (
           <div style={{ marginBottom: 10 }}>
             <div
@@ -2273,7 +2443,7 @@ export default function VariationEngine() {
                   color: "var(--color-text-secondary)",
                 }}
               >
-                Gemini API Keys — Round-Robin (
+                Gemini API Keys — Worker per Key (
                 {apiKeys.filter((k) => k.trim()).length} active)
               </label>
               <div style={{ display: "flex", gap: 6 }}>
@@ -2354,6 +2524,20 @@ export default function VariationEngine() {
                       {keyUsage[`key${i}`]} calls
                     </span>
                   )}
+                  {deniedKeysRef.current.has(i) && (
+                    <span
+                      style={{
+                        fontSize: 10,
+                        padding: "1px 6px",
+                        background: "#FAECE7",
+                        color: "#993C1D",
+                        borderRadius: 3,
+                        whiteSpace: "nowrap",
+                      }}
+                    >
+                      denied
+                    </span>
+                  )}
                 </div>
               ))}
             </div>
@@ -2375,9 +2559,6 @@ export default function VariationEngine() {
                 style={{ ...inputStyle, height: 36 }}
                 disabled={running}
               >
-                <option value="gemini-3.1-flash-lite">
-                  gemini-3.1-flash-lite
-                </option>
                 <option value="gemini-3.1-flash-lite-preview">
                   gemini-3.1-flash-lite-preview (500 RPD/key)
                 </option>
@@ -2983,8 +3164,8 @@ export default function VariationEngine() {
               Merchant Name, Category, Website URL, DB Slug
             </code>
             <br />
-            Slug enables DB coupon fetch AND auto-saves generated content. Use
-            "Load Pending" to auto-fill stores with no content yet.
+            Each key runs as an independent worker. N keys = N stores processed
+            in parallel.
           </div>
 
           <div style={{ marginBottom: "0.9rem" }}>
@@ -3039,7 +3220,7 @@ export default function VariationEngine() {
             />
           </div>
 
-          {batchRows.length > 0 && (
+          {batchRows.length > 0 && !running && (
             <div
               style={{
                 background: "var(--color-background-secondary)",
@@ -3056,7 +3237,20 @@ export default function VariationEngine() {
               <span>
                 📋 <strong>{batchRows.length}</strong> merchants
               </span>
-              <span>⏱ ~{Math.ceil((batchRows.length * 4.2 * 2) / 60)} min</span>
+              <span>
+                🔑 <strong>{apiKeys.filter((k) => k.trim()).length}</strong>{" "}
+                workers
+              </span>
+              <span>
+                ⏱ ~
+                {Math.ceil(
+                  ((batchRows.length /
+                    Math.max(apiKeys.filter((k) => k.trim()).length, 1)) *
+                    25) /
+                    60,
+                )}{" "}
+                min
+              </span>
               <span>
                 🗄 DB slugs: {batchRows.filter((r) => r.slug).length}/
                 {batchRows.length}
@@ -3064,9 +3258,14 @@ export default function VariationEngine() {
             </div>
           )}
 
+          {/* Live worker panel */}
+          {running && activeWorkerCount > 0 && (
+            <WorkerPanel workers={workerStates} />
+          )}
+
           {running && (
             <div style={{ marginBottom: "0.9rem" }}>
-              <ProgressBar value={batchIdx} max={batchTotal} />
+              <ProgressBar value={batchDone} max={batchTotal} />
               <div
                 style={{
                   fontSize: 12,
@@ -3074,7 +3273,8 @@ export default function VariationEngine() {
                   marginTop: 4,
                 }}
               >
-                {status}
+                {batchDone}/{batchTotal} complete · {activeWorkerCount} workers
+                active
               </div>
             </div>
           )}
@@ -3099,7 +3299,7 @@ export default function VariationEngine() {
               }}
             >
               {running
-                ? `⏳ Processing ${batchIdx}/${batchTotal}…`
+                ? `⏳ Processing ${batchDone}/${batchTotal}…`
                 : "🚀 Start Batch"}
             </button>
             {running && (
