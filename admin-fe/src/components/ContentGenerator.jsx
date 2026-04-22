@@ -1581,10 +1581,11 @@ export default function VariationEngine() {
   const [apiKey, setApiKey] = useState(""); // used for single mode
   const [apiKeys, setApiKeys] = useState([""]); // used for batch mode round-robin
   const [backendUrl, setBackendUrl] = useState(BACKEND_URL);
-  const [model, setModel] = useState("gemini-3.1-flash-lite-preview");
+  const [model, setModel] = useState("gemini-3.1-flash-lite");
   const [useDB, setUseDB] = useState(true);
   const [keyUsage, setKeyUsage] = useState({}); // { keyIndex: callCount }
   const keyIdxRef = useRef(0); // current round-robin pointer
+  const deniedKeysRef = useRef(new Set()); // keys permanently removed from rotation
 
   const [merchant, setMerchant] = useState("");
   const [category, setCategory] = useState("");
@@ -1744,7 +1745,7 @@ export default function VariationEngine() {
   const getNextKey = () => {
     const valid = apiKeys
       .map((k, i) => ({ k: k.trim(), i }))
-      .filter((x) => x.k);
+      .filter((x) => x.k && !deniedKeysRef.current.has(x.i));
     if (!valid.length) return null;
     const pick = valid[keyIdxRef.current % valid.length];
     keyIdxRef.current = (keyIdxRef.current + 1) % valid.length;
@@ -1761,14 +1762,30 @@ export default function VariationEngine() {
       }));
       return result;
     } catch (e) {
-      const isQuota =
-        e.message?.includes("429") ||
-        e.message?.toLowerCase().includes("quota");
+      const msg = e.message?.toLowerCase() || "";
+      const isQuota = e.message?.includes("429") || msg.includes("quota");
+      const isHighLoad =
+        msg.includes("high demand") ||
+        msg.includes("high load") ||
+        msg.includes("experiencing high");
+      const isDenied =
+        msg.includes("denied access") ||
+        msg.includes("project has been denied");
       const isRetryable =
-        isQuota || e.message?.includes("500") || e.message?.includes("503");
+        (isQuota ||
+          isHighLoad ||
+          e.message?.includes("500") ||
+          e.message?.includes("503")) &&
+        !isDenied;
+
+      if (isDenied) {
+        deniedKeysRef.current.add(keyEntry.i);
+        throw new Error(
+          `Key ${keyEntry.i + 1} denied access — removed from rotation`,
+        );
+      }
 
       if (isRetryable && attempt < 3) {
-        // On quota — rotate key first, then wait
         let nextKey = keyEntry;
         if (isQuota) {
           const rotated = getNextKey();
@@ -1779,8 +1796,14 @@ export default function VariationEngine() {
             nextKey = rotated;
           }
         }
-        const wait = isQuota ? 30000 : (attempt + 1) * 5000; // 30s on quota, 5/10/15s on server error
-        setStatus(`Retry ${attempt + 1}/3 — waiting ${wait / 1000}s…`);
+        const wait = isHighLoad
+          ? 45000
+          : isQuota
+            ? 30000
+            : (attempt + 1) * 5000;
+        setStatus(
+          `Retry ${attempt + 1}/3 — ${isHighLoad ? "model high load" : isQuota ? "quota" : "server error"} — waiting ${wait / 1000}s…`,
+        );
         await new Promise((res) => setTimeout(res, wait));
         return callWithRetry(prompt, nextKey, attempt + 1);
       }
@@ -1857,12 +1880,13 @@ export default function VariationEngine() {
       setBatchResults([]);
       keyIdxRef.current = 0;
       setKeyUsage({});
+      deniedKeysRef.current = new Set();
     }
     stopRef.current = false;
     setRunning(true);
     setBatchTotal(rows.length);
 
-    const RPM_DELAY = 4200; // 15 RPM = 1 per 4s — use 4.2s for safety margin
+    const RPM_DELAY = 1200;
 
     for (let i = 0; i < rows.length; i++) {
       if (stopRef.current) break;
@@ -2214,6 +2238,9 @@ export default function VariationEngine() {
                 style={{ ...inputStyle, height: 36 }}
                 disabled={running}
               >
+                <option value="gemini-3.1-flash-lite">
+                  gemini-3.1-flash-lite
+                </option>
                 <option value="gemini-3.1-flash-lite-preview">
                   gemini-3.1-flash-lite-preview (500 RPD)
                 </option>
@@ -2348,6 +2375,9 @@ export default function VariationEngine() {
                 style={{ ...inputStyle, height: 36 }}
                 disabled={running}
               >
+                <option value="gemini-3.1-flash-lite">
+                  gemini-3.1-flash-lite
+                </option>
                 <option value="gemini-3.1-flash-lite-preview">
                   gemini-3.1-flash-lite-preview (500 RPD/key)
                 </option>
@@ -3126,6 +3156,17 @@ export default function VariationEngine() {
                     ✗ {batchResults.filter((r) => r.status === "error").length}{" "}
                     failed
                   </span>
+                  {batchResults.filter((r) => r.status === "skipped").length >
+                    0 && (
+                    <span style={{ color: "#6c757d" }}>
+                      ⏭{" "}
+                      {
+                        batchResults.filter((r) => r.status === "skipped")
+                          .length
+                      }{" "}
+                      skipped
+                    </span>
+                  )}
                   <span>
                     💾 {batchResults.filter((r) => r.saved).length} saved
                   </span>
