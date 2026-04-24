@@ -1,12 +1,16 @@
 /**
- * SavingHarbor — Content Architecture Variation Engine v2.4
- * Changes from v2.3:
- * - Worker-pool batch: N keys → N concurrent workers, zero idle time
- * - Smarter backoff: exponential 10s*2^attempt ±2s jitter (was flat 45s)
- * - Removed preemptive 1200ms RPM_DELAY — backoff only on real errors
- * - stopRef checked inside each worker (immediate halt, not end-of-store)
- * - Live per-worker status display (which key is on which store)
- * - batchIdx incremented via ref (race-safe across concurrent workers)
+ * SavingHarbor — Content Architecture Variation Engine v2.5
+ * Changes from v2.4:
+ * - FAQ_QUESTION_TYPES: removed `stacking` and `howto`; remaining 10 rewritten
+ *   with mandatory "THIS store / from DB data / from crawl research" specificity.
+ *   No two types can produce overlapping questions when instructions are followed.
+ * - BLUEPRINTS: every section's `heads` array expanded; more spread per hash.
+ * - getVariation: added h3 = stableHash(merchantName + "|" + category + "|v3").
+ *   Section depths now driven by h3 (independent of h2 used for FAQ selection).
+ *   Returns headingSeed: h3.
+ * - buildHeading: accepts optional headingSeed param. XORs it with base hash
+ *   before indexing into heads[] → same store + same section produces a
+ *   different heading than v2.4 because h3 is a fully independent hash value.
  */
 
 import { useState, useRef, useCallback } from "react";
@@ -173,6 +177,67 @@ const HEADING_STYLES = [
   { id: "benefit", label: "Benefit-Led" },
 ];
 
+// ─── FAQ_QUESTION_TYPES ───────────────────────────────────────────
+// `stacking` and `howto` removed.
+// Every remaining instruction opens with a hard specificity anchor
+// ("THIS store's DB data", "from crawl research", etc.) so the model
+// cannot produce a generic question answerable for any store.
+// No two types target the same information axis.
+const FAQ_QUESTION_TYPES = [
+  {
+    id: "savings",
+    instruction:
+      "Ask specifically about THIS store's maximum or typical discount percentage — cite the exact figure from DB data (e.g. 'up to X% off'). The question must name a product category or deal type unique to this merchant. BANNED: generic 'how much can I save?' phrasing.",
+  },
+  {
+    id: "validity",
+    instruction:
+      "Ask about expiry windows, exclusion clauses, or minimum-order conditions on THIS store's coupons, drawing on the specific offer types present in DB data (e.g. percent-off vs. flat-off). The question must reference a concrete condition, not a vague 'terms and conditions' catch-all.",
+  },
+  {
+    id: "comparison",
+    instruction:
+      "Ask how THIS store's pricing or deal frequency compares to a named competitor or category alternative — derive the comparison angle from crawl research (product positioning, price tier, niche). BANNED: 'is X cheaper than other stores?' without naming a concrete comparison point from the research.",
+  },
+  {
+    id: "trust",
+    instruction:
+      "Ask a verification-specific question about THIS store's coupon accuracy: how often SavingHarbor updates the codes, what the verified vs. unverified ratio is, or whether expired codes are removed promptly. Must reference DB data (totalCoupons, totalDeals) as evidence. BANNED: vague 'are coupons real?' phrasing.",
+  },
+  {
+    id: "product",
+    instruction:
+      "Ask something specific about a product line, feature set, or service that crawl research identified as unique to THIS merchant — not something that applies to the entire category. The question must make the store's name non-substitutable (i.e. swapping the name for a competitor would make the question factually wrong).",
+  },
+  {
+    id: "shipping",
+    instruction:
+      "Ask about THIS store's free-shipping threshold or delivery speed — use hasFreeShipping from DB data to frame the question accurately. If hasFreeShipping is true, ask what the threshold or conditions are; if false, ask what the standard shipping cost is. BANNED: generic 'does X offer free shipping?' with no follow-through.",
+  },
+  {
+    id: "returns",
+    instruction:
+      "Ask about THIS store's return window, restocking fees, or conditions for a specific product type identified in crawl research. The question must be tied to a concrete product category or situation (e.g. 'opened supplements', 'worn footwear', 'digital downloads') — not a blanket refund question.",
+  },
+  {
+    id: "newuser",
+    instruction:
+      "Ask specifically about the first-order or new-customer discount at THIS store, using hasNewUserOffer from DB data. If the offer exists, ask what it covers and whether it stacks with other promotions. If it does not exist, ask what the best alternative is for first-time buyers. BANNED: 'is there a discount for new users?' without referencing DB data status.",
+  },
+  {
+    id: "category",
+    instruction:
+      "Ask which specific product categories or SKU types at THIS store historically carry the deepest discounts — ground the answer in DB data (couponTypes, topOffers) and crawl research (product lines). BANNED: 'which products have the best deals?' without tying it to THIS store's actual offer types.",
+  },
+  {
+    id: "frequency",
+    instruction:
+      "Ask how often THIS store launches new promotions or refreshes its coupon inventory — frame the question using totalCoupons and totalDeals from DB data as context clues. If the store runs seasonal events mentioned in crawl research, name them. BANNED: generic 'how often does X run sales?' with no data anchor.",
+  },
+];
+
+// ─── BLUEPRINTS ───────────────────────────────────────────────────
+// Every section's heads array expanded to 12 entries for wider hash spread.
 const BLUEPRINTS = [
   {
     id: "fashion",
@@ -201,6 +266,10 @@ const BLUEPRINTS = [
           "What Drives {m}",
           "{m}: Brand Origins",
           "A Closer Look at {m}",
+          "Inside the {m} Brand",
+          "{m} — From Idea to Icon",
+          "The Vision That Built {m}",
+          "Why {m} Exists",
         ],
       },
       {
@@ -214,6 +283,10 @@ const BLUEPRINTS = [
           "What's Available at {m}",
           "{m} Product Overview",
           "Everything {m} Offers",
+          "{m} Styles & Categories",
+          "Browsing the {m} Range",
+          "What You'll Find at {m}",
+          "The {m} Collection at a Glance",
         ],
       },
       {
@@ -227,6 +300,10 @@ const BLUEPRINTS = [
           "Fit, Feel & Finish at {m}",
           "{m} Construction Standards",
           "Judging {m} by Its Materials",
+          "Fabric, Fit & Durability at {m}",
+          "Is {m} Worth the Price Tag?",
+          "How {m} Garments Hold Up",
+          "The Real Quality Story at {m}",
         ],
       },
       {
@@ -240,6 +317,10 @@ const BLUEPRINTS = [
           "{m}'s Ethical Commitments",
           "Does {m} Care About the Planet?",
           "The Sustainability Side of {m}",
+          "{m} and Conscious Production",
+          "How Green Is {m}?",
+          "Ethics, Labour & Environment at {m}",
+          "What {m} Is Doing for the Planet",
         ],
       },
       {
@@ -253,6 +334,10 @@ const BLUEPRINTS = [
           "{m} After-Purchase Experience",
           "Is {m} Easy to Deal With?",
           "Support & Returns at {m}",
+          "How {m} Treats Its Customers",
+          "Resolving Problems at {m}",
+          "Returns, Refunds & Help at {m}",
+          "The {m} Support Experience",
         ],
       },
       {
@@ -266,6 +351,10 @@ const BLUEPRINTS = [
           "{m} Discount Periods",
           "Catching {m} at Its Best Price",
           "Getting More for Less at {m}",
+          "{m} Promotions Worth Knowing",
+          "How to Pay Less at {m}",
+          "The Cheapest Times to Shop {m}",
+          "Maximising Value at {m}",
         ],
       },
     ],
@@ -299,6 +388,10 @@ const BLUEPRINTS = [
           "{m}: Company Overview",
           "Understanding {m}",
           "What Kind of Company Is {m}?",
+          "{m} — Origin & Mission",
+          "The Team Behind {m}",
+          "How {m} Came to Be",
+          "What {m} Is Really About",
         ],
       },
       {
@@ -312,6 +405,10 @@ const BLUEPRINTS = [
           "Exploring {m}'s Products",
           "What {m} Actually Sells",
           "The {m} Product Catalog",
+          "A Tour of {m}'s Offerings",
+          "Devices & Services from {m}",
+          "What's in the {m} Portfolio",
+          "{m} Products Worth Knowing",
         ],
       },
       {
@@ -325,6 +422,10 @@ const BLUEPRINTS = [
           "Where {m} Outperforms",
           "What Sets {m} Apart Technically",
           "The Engineering Behind {m}",
+          "{m}'s Signature Technology",
+          "How {m} Raises the Bar",
+          "Under the Hood: {m}",
+          "The R&D Story at {m}",
         ],
       },
       {
@@ -338,6 +439,10 @@ const BLUEPRINTS = [
           "Is {m}'s Warranty Worth It?",
           "Support After Buying from {m}",
           "Getting Help with {m} Products",
+          "{m} Repair & Replacement Policy",
+          "What's Covered Under {m} Warranty",
+          "Post-Purchase Peace of Mind at {m}",
+          "How Far Does {m}'s Support Go?",
         ],
       },
       {
@@ -351,6 +456,10 @@ const BLUEPRINTS = [
           "Honest Opinions on {m}",
           "The {m} Verdict from Real Users",
           "Does {m} Live Up to the Hype?",
+          "Verified {m} Customer Opinions",
+          "Long-Term Reviews of {m}",
+          "Is {m} as Good as Advertised?",
+          "What the Community Says About {m}",
         ],
       },
       {
@@ -364,6 +473,10 @@ const BLUEPRINTS = [
           "Discount Opportunities at {m}",
           "Getting {m} for Less",
           "Smart Buying at {m}",
+          "The Best {m} Offers Right Now",
+          "Saving on {m} Tech",
+          "Cheapest Ways to Buy {m}",
+          "How Deals Work at {m}",
         ],
       },
     ],
@@ -397,6 +510,10 @@ const BLUEPRINTS = [
           "Why {m} Exists",
           "What {m} Believes In",
           "{m}'s Approach to Wellness",
+          "The Purpose Driving {m}",
+          "How {m} Defines Wellness",
+          "What Makes {m} Different at Its Core",
+          "The Founding Idea Behind {m}",
         ],
       },
       {
@@ -410,6 +527,10 @@ const BLUEPRINTS = [
           "Inside {m}'s Formulations",
           "The Science of {m} Ingredients",
           "Quality Standards in {m} Products",
+          "How {m} Sources Its Ingredients",
+          "Purity & Potency at {m}",
+          "What's Actually in {m} Products",
+          "The Formulation Philosophy at {m}",
         ],
       },
       {
@@ -423,6 +544,10 @@ const BLUEPRINTS = [
           "How {m} Proves Its Quality",
           "Trusting {m}: The Certification Story",
           "What {m}'s Certifications Mean",
+          "Independent Testing at {m}",
+          "How {m} Earns Your Trust",
+          "Lab Results & Compliance at {m}",
+          "The Audit Trail Behind {m}",
         ],
       },
       {
@@ -436,6 +561,10 @@ const BLUEPRINTS = [
           "Is {m} the Right Choice?",
           "Matching Your Needs to {m}",
           "Who Should Use {m}?",
+          "The Ideal {m} Customer",
+          "Health Goals {m} Supports Best",
+          "Is Your Lifestyle a Fit for {m}?",
+          "Choosing {m} for Your Wellness Routine",
         ],
       },
       {
@@ -449,6 +578,10 @@ const BLUEPRINTS = [
           "Resources & Support at {m}",
           "The {m} Customer Experience",
           "Help, FAQs & Community at {m}",
+          "Expert Guidance at {m}",
+          "Post-Purchase Support at {m}",
+          "How {m} Goes Beyond the Sale",
+          "Community & Care at {m}",
         ],
       },
       {
@@ -462,6 +595,10 @@ const BLUEPRINTS = [
           "What Customers Actually Experience with {m}",
           "{m} in the Real World",
           "Verified Feedback on {m}",
+          "Long-Term {m} User Opinions",
+          "Do {m} Products Actually Work?",
+          "Success Stories from {m} Customers",
+          "What the Community Says About {m}",
         ],
       },
       {
@@ -475,6 +612,10 @@ const BLUEPRINTS = [
           "Finding {m} Discounts",
           "Saving Without Compromising on {m}",
           "The Best Way to Buy {m} for Less",
+          "{m} Subscription vs. One-Off Savings",
+          "When {m} Runs Its Best Offers",
+          "Loyalty & Referral Savings at {m}",
+          "Making {m} More Affordable Long-Term",
         ],
       },
     ],
@@ -508,6 +649,10 @@ const BLUEPRINTS = [
           "What Makes {m} Different from the Start",
           "The Journey Behind {m}",
           "Getting to Know {m}",
+          "Inside the {m} Brand",
+          "The Passion Behind {m}",
+          "How {m} Found Its Niche",
+          "{m} — From Kitchen Table to Market",
         ],
       },
       {
@@ -521,6 +666,10 @@ const BLUEPRINTS = [
           "What {m} Offers",
           "The Full {m} Selection",
           "What's Available from {m}",
+          "A Taste of the {m} Catalog",
+          "What {m} Has on Offer",
+          "Browsing the {m} Menu",
+          "The {m} Product Portfolio",
         ],
       },
       {
@@ -534,6 +683,10 @@ const BLUEPRINTS = [
           "How {m} Maintains Freshness",
           "Is {m} Particular About Sourcing?",
           "The Supply Chain Behind {m}",
+          "From Farm to {m}: Sourcing Explained",
+          "Ingredient Transparency at {m}",
+          "What {m} Looks for in a Supplier",
+          "Quality Control in the {m} Kitchen",
         ],
       },
       {
@@ -547,6 +700,10 @@ const BLUEPRINTS = [
           "Navigating {m} for Your Dietary Needs",
           "{m} and Dietary Preferences",
           "Finding Your Fit in the {m} Range",
+          "{m} for Vegan, Gluten-Free & More",
+          "Special Diet Shopping at {m}",
+          "How Inclusive Is the {m} Menu?",
+          "What {m} Offers Restricted-Diet Shoppers",
         ],
       },
       {
@@ -560,6 +717,10 @@ const BLUEPRINTS = [
           "How Fast Does {m} Deliver?",
           "Ordering from {m}: What You Need to Know",
           "Shipping & Packaging at {m}",
+          "Cold Chain & Freshness at {m}",
+          "Last-Mile Delivery Standards at {m}",
+          "How {m} Packages Perishables",
+          "Tracking & Lead Times at {m}",
         ],
       },
       {
@@ -573,6 +734,10 @@ const BLUEPRINTS = [
           "Discount Opportunities at {m}",
           "Making {m} More Affordable",
           "Finding the Best {m} Prices",
+          "Bundle Savings at {m}",
+          "When {m} Drops Prices",
+          "Subscription Discounts at {m}",
+          "How to Pay Less Per Order at {m}",
         ],
       },
     ],
@@ -607,6 +772,10 @@ const BLUEPRINTS = [
           "How {m} Built Its Reputation",
           "The Background of {m}",
           "What {m} Is Known For",
+          "{m} — Decades of Home Expertise",
+          "How {m} Earned Its Place in Homes",
+          "The Founding Principles of {m}",
+          "What Makes {m} a Trusted Name",
         ],
       },
       {
@@ -620,6 +789,10 @@ const BLUEPRINTS = [
           "The Breadth of {m}'s Selection",
           "What Can You Buy at {m}?",
           "Products & Categories at {m}",
+          "Room by Room: What {m} Covers",
+          "The Scope of {m}'s Range",
+          "From Garden to Living Room: {m}",
+          "Every Category {m} Serves",
         ],
       },
       {
@@ -633,6 +806,10 @@ const BLUEPRINTS = [
           "Durability & Finish at {m}",
           "The Craftsmanship Behind {m}",
           "Testing {m}'s Quality Claims",
+          "Will {m} Products Stand the Test of Time?",
+          "Materials & Joints: {m} Examined",
+          "How {m} Quality Compares",
+          "What Real Owners Say About {m} Durability",
         ],
       },
       {
@@ -646,6 +823,10 @@ const BLUEPRINTS = [
           "What Happens After You Order from {m}",
           "Receiving & Setting Up {m} Products",
           "Lead Times & Logistics at {m}",
+          "White-Glove Delivery at {m}?",
+          "Kerb to Room: {m} Logistics",
+          "How Long Does {m} Delivery Take?",
+          "Unpacking Your {m} Order",
         ],
       },
       {
@@ -659,6 +840,10 @@ const BLUEPRINTS = [
           "Before & After with {m}",
           "Customer Spaces Featuring {m}",
           "See What {m} Looks Like in Real Homes",
+          "Living with {m}: Real Interiors",
+          "How {m} Looks Beyond the Showroom",
+          "Styled: {m} in Customer Homes",
+          "Room Makeovers Powered by {m}",
         ],
       },
       {
@@ -672,6 +857,10 @@ const BLUEPRINTS = [
           "The Best Times to Buy from {m}",
           "Saving on {m} Furniture & Decor",
           "Getting the Most Value from {m}",
+          "Clearance & Outlet Deals at {m}",
+          "End-of-Season Savings at {m}",
+          "How to Stack Value at {m}",
+          "When {m} Has Its Best Sale Events",
         ],
       },
     ],
@@ -705,6 +894,10 @@ const BLUEPRINTS = [
           "The Pain Point Behind {m}",
           "Understanding {m}'s Purpose",
           "Why Teams Turn to {m}",
+          "The Workflow Problem {m} Fixes",
+          "What Breaks Without {m}",
+          "The Business Case for {m}",
+          "What {m} Set Out to Solve",
         ],
       },
       {
@@ -718,6 +911,10 @@ const BLUEPRINTS = [
           "What You Get with {m}",
           "How {m} Works in Practice",
           "A Feature-by-Feature Look at {m}",
+          "The Full Capability Map of {m}",
+          "{m} Power Features Explained",
+          "What {m} Does That Others Don't",
+          "Feature Depth at {m}",
         ],
       },
       {
@@ -731,6 +928,10 @@ const BLUEPRINTS = [
           "Is {m} Worth the Price?",
           "Comparing {m} Plans",
           "Finding the Right {m} Plan for You",
+          "Free vs. Paid at {m}",
+          "What Each {m} Plan Includes",
+          "The True Cost of {m}",
+          "ROI of {m}: Is It Worth It?",
         ],
       },
       {
@@ -744,6 +945,10 @@ const BLUEPRINTS = [
           "Getting Started with {m} for Free",
           "What the {m} Trial Includes",
           "Testing {m} Before Paying",
+          "How Long Is the {m} Free Trial?",
+          "What's Unlocked in the {m} Demo?",
+          "No-Risk Ways to Try {m}",
+          "The {m} Freemium Explained",
         ],
       },
       {
@@ -757,6 +962,10 @@ const BLUEPRINTS = [
           "Expanding {m} with Integrations",
           "What {m} Plays Well With",
           "Connecting {m} to Your Workflow",
+          "The {m} API & Developer Tools",
+          "Which Apps Plug Into {m}",
+          "Native vs. Third-Party {m} Integrations",
+          "Automations You Can Build on {m}",
         ],
       },
       {
@@ -770,6 +979,10 @@ const BLUEPRINTS = [
           "Documentation & Help at {m}",
           "Is {m}'s Support Actually Good?",
           "Resources for {m} Users",
+          "Response Times & SLAs at {m}",
+          "Self-Service Options at {m}",
+          "How {m} Onboards New Users",
+          "The Support Tier Structure at {m}",
         ],
       },
       {
@@ -783,6 +996,10 @@ const BLUEPRINTS = [
           "{m} Pricing Hacks",
           "Is the {m} Annual Plan Worth It?",
           "Finding {m} Promo Codes",
+          "Education & Nonprofit Rates at {m}",
+          "Team Plan Savings at {m}",
+          "How to Negotiate {m} Pricing",
+          "When {m} Drops Its Price",
         ],
       },
     ],
@@ -816,6 +1033,10 @@ const BLUEPRINTS = [
           "The {m} Service Overview",
           "What Can You Do with {m}?",
           "An Introduction to {m}",
+          "What {m} Specialises In",
+          "The Mission Behind {m}",
+          "How {m} Positions Itself",
+          "Why Travellers Choose {m}",
         ],
       },
       {
@@ -829,6 +1050,10 @@ const BLUEPRINTS = [
           "Destinations Available Through {m}",
           "Exploring What {m} Offers",
           "The Range of {m} Travel Options",
+          "Regions & Routes at {m}",
+          "What's Bookable on {m}",
+          "Global Reach of {m}",
+          "Where in the World Does {m} Go?",
         ],
       },
       {
@@ -842,6 +1067,10 @@ const BLUEPRINTS = [
           "Is {m} Easy to Book With?",
           "What to Expect When Booking {m}",
           "Step-by-Step: Booking on {m}",
+          "The Checkout Flow at {m}",
+          "Payment & Confirmation at {m}",
+          "How {m} Confirms Your Reservation",
+          "Booking Flexibility at {m}",
         ],
       },
       {
@@ -855,6 +1084,10 @@ const BLUEPRINTS = [
           "Understanding {m}'s Refund Terms",
           "Changes & Cancellations at {m}",
           "The Fine Print at {m}",
+          "Force Majeure & Exceptions at {m}",
+          "Partial Refunds at {m}: What's Covered",
+          "Reading the {m} T&Cs",
+          "Can You Change Your {m} Booking?",
         ],
       },
       {
@@ -868,6 +1101,10 @@ const BLUEPRINTS = [
           "Verified {m} Customer Feedback",
           "What Real Guests Say About {m}",
           "Traveller Verdict on {m}",
+          "Independent Reviews of {m}",
+          "Repeat Customers at {m}: Why They Return",
+          "Complaints & Praise at {m}",
+          "Star Ratings & Trust Scores for {m}",
         ],
       },
       {
@@ -881,6 +1118,10 @@ const BLUEPRINTS = [
           "Getting More Value from {m}",
           "The Best {m} Deals Right Now",
           "Smart Booking Tips for {m}",
+          "Last-Minute Savings at {m}",
+          "Member Rates & Loyalty Perks at {m}",
+          "When {m} Runs Flash Sales",
+          "Package Deal Savings at {m}",
         ],
       },
     ],
@@ -901,6 +1142,10 @@ const BLUEPRINTS = [
           "Understanding {m}",
           "The {m} Brand Explained",
           "What Makes {m} Tick?",
+          "A Closer Look at {m}",
+          "The {m} Brand at a Glance",
+          "Inside {m}",
+          "Why {m} Matters",
         ],
       },
       {
@@ -914,6 +1159,10 @@ const BLUEPRINTS = [
           "What You Can Buy at {m}",
           "Exploring the {m} Catalog",
           "What {m} Brings to the Table",
+          "The Complete {m} Product List",
+          "Categories at {m}",
+          "What's Available from {m}",
+          "The {m} Inventory Explained",
         ],
       },
       {
@@ -927,6 +1176,10 @@ const BLUEPRINTS = [
           "Making the Case for {m}",
           "Is {m} the Right Choice?",
           "Why Customers Keep Coming Back to {m}",
+          "What {m} Gets Right",
+          "The Case for {m}",
+          "Standing Out: Why {m}",
+          "What You're Really Getting at {m}",
         ],
       },
       {
@@ -940,6 +1193,10 @@ const BLUEPRINTS = [
           "Buying from {m}: What to Know",
           "Is {m} a Good Place to Shop?",
           "From Browse to Checkout at {m}",
+          "The End-to-End {m} Experience",
+          "What {m} Is Like in Practice",
+          "First-Time Shopping at {m}",
+          "How {m} Handles the Full Purchase",
         ],
       },
       {
@@ -953,6 +1210,10 @@ const BLUEPRINTS = [
           "What Happens When You Need Help at {m}",
           "Reaching {m} When It Matters",
           "The Support Side of {m}",
+          "Response Times at {m}",
+          "Channels & Hours: {m} Support",
+          "Does {m} Have Live Chat?",
+          "How {m} Resolves Complaints",
         ],
       },
       {
@@ -966,6 +1227,10 @@ const BLUEPRINTS = [
           "Discount & Coupon Strategy for {m}",
           "When Does {m} Offer the Best Prices?",
           "Saving Smart at {m}",
+          "The Cheapest Way to Shop {m}",
+          "Loyalty Rewards & Promos at {m}",
+          "How Coupon Codes Work at {m}",
+          "Maximising Every {m} Order",
         ],
       },
     ],
@@ -980,9 +1245,11 @@ function detectBlueprint(category) {
   return BLUEPRINTS[BLUEPRINTS.length - 1];
 }
 
-function buildHeading(section, merchant, headingStyleId) {
-  const h = stableHash(merchant + section.id);
-  const base = section.heads[h % section.heads.length].replace(
+// headingSeed XORs with the base hash so the same store+section picks a
+// different head when called with a different seed (h3 vs. the default h).
+function buildHeading(section, merchant, headingStyleId, headingSeed = 0) {
+  const h = stableHash(merchant + section.id) ^ headingSeed;
+  const base = section.heads[Math.abs(h) % section.heads.length].replace(
     /{m}/g,
     merchant,
   );
@@ -990,95 +1257,43 @@ function buildHeading(section, merchant, headingStyleId) {
   return base;
 }
 
-const FAQ_QUESTION_TYPES = [
-  {
-    id: "savings",
-    instruction:
-      "Ask specifically about the maximum or typical discount available, referencing actual DB figures if present.",
-  },
-  {
-    id: "howto",
-    instruction:
-      "Ask how to actually use a coupon code or deal at checkout on this specific store.",
-  },
-  {
-    id: "validity",
-    instruction:
-      "Ask about expiry, terms, or conditions on the deals — e.g. which products are excluded.",
-  },
-  {
-    id: "comparison",
-    instruction:
-      "Ask how this store's prices or deals compare to alternatives in the same category.",
-  },
-  {
-    id: "trust",
-    instruction:
-      "Ask a credibility question — are the coupons verified, how often are they updated, who verifies them.",
-  },
-  {
-    id: "product",
-    instruction:
-      "Ask something specific about a product line, feature, or service unique to this merchant from the research.",
-  },
-  {
-    id: "shipping",
-    instruction:
-      "Ask about shipping costs, free shipping thresholds, or delivery times for this store.",
-  },
-  {
-    id: "returns",
-    instruction:
-      "Ask about the return or refund policy — what's covered, how long, any conditions.",
-  },
-  {
-    id: "stacking",
-    instruction:
-      "Ask whether multiple coupons or deals can be combined on a single order.",
-  },
-  {
-    id: "newuser",
-    instruction:
-      "Ask if there's a specific first-order or new customer discount and what it covers.",
-  },
-  {
-    id: "category",
-    instruction:
-      "Ask which product categories or items tend to have the best discounts at this store.",
-  },
-  {
-    id: "frequency",
-    instruction:
-      "Ask how often new deals appear or how frequently the store runs promotions.",
-  },
-];
+const FAQ_QUESTION_TYPES_LIST = FAQ_QUESTION_TYPES; // alias for clarity below
 
 function getVariation(merchantName, category) {
-  const h = stableHash(merchantName + "|" + category);
+  const h  = stableHash(merchantName + "|" + category);
   const h2 = stableHash(merchantName + "|" + category + "|v2");
+  const h3 = stableHash(merchantName + "|" + category + "|v3"); // NEW seed
+
   const bp = detectBlueprint(category);
-  const faqCount = 5 + (h2 % 4);
+
+  // FAQ selection uses h2 (unchanged)
+  const faqCount = 5 + (h2 % 4); // 5–8 questions
   const faqTypes = [];
   for (let i = 0; i < faqCount; i++) {
-    const idx = (h2 >> (i * 4)) % FAQ_QUESTION_TYPES.length;
-    const pick = FAQ_QUESTION_TYPES[(idx + i) % FAQ_QUESTION_TYPES.length];
-    if (!faqTypes.find((f) => f.id === pick.id)) faqTypes.push(pick);
-    else
+    const idx = (h2 >> (i * 4)) % FAQ_QUESTION_TYPES_LIST.length;
+    const pick = FAQ_QUESTION_TYPES_LIST[(idx + i) % FAQ_QUESTION_TYPES_LIST.length];
+    if (!faqTypes.find((f) => f.id === pick.id)) {
+      faqTypes.push(pick);
+    } else {
       faqTypes.push(
-        FAQ_QUESTION_TYPES[(idx + i + 1) % FAQ_QUESTION_TYPES.length],
+        FAQ_QUESTION_TYPES_LIST[(idx + i + 1) % FAQ_QUESTION_TYPES_LIST.length],
       );
+    }
   }
+
   return {
     blueprint: bp,
     tone: TONES[h % 4],
     angle: ANGLES[(h >> 4) % 4],
     headingStyle: HEADING_STYLES[(h >> 8) % 3],
+    // Section depths now driven by h3 — independent of h2
     sectionDepths: bp.sections.map((_, i) => {
       const depths = ["brief", "standard", "detailed"];
-      return depths[(h2 >> (i * 3 + 1)) % 3];
+      return depths[(h3 >> (i * 3 + 1)) % 3];
     }),
     faqCount,
     faqTypes,
+    headingSeed: h3, // exposed so buildHeading callers can pass it in
   };
 }
 
@@ -1163,7 +1378,7 @@ function buildFinalPrompt(
   dbData,
   url,
 ) {
-  const { blueprint, tone, angle, headingStyle, sectionDepths } = variation;
+  const { blueprint, tone, angle, headingStyle, sectionDepths, headingSeed } = variation;
   const ds = buildDiscountSummary(dbData);
   const dbFacts = ds
     ? `
@@ -1182,7 +1397,7 @@ LIVE STORE STATS (mandatory — weave these into content naturally):
 
   const sectionInstructions = blueprint.sections
     .map((s, i) => {
-      const heading = buildHeading(s, merchantName, headingStyle.id);
+      const heading = buildHeading(s, merchantName, headingStyle.id, headingSeed);
       const depth = sectionDepths[i];
       const wordRange =
         depth === "brief"
@@ -1580,9 +1795,8 @@ function SaveStatus({ status }) {
   return <StatusBadge {...(map[status] || map.skipped)} />;
 }
 
-// ─── WORKER STATUS PANEL (new) ────────────────────────────────────
+// ─── WORKER STATUS PANEL ──────────────────────────────────────────
 function WorkerPanel({ workers }) {
-  // workers: { [keyIdx]: { store, stage, status } }
   const entries = Object.entries(workers);
   if (!entries.length) return null;
   return (
@@ -1693,8 +1907,7 @@ export default function VariationEngine() {
   const [useDB, setUseDB] = useState(true);
   const [keyUsage, setKeyUsage] = useState({});
 
-  // Worker pool state (new)
-  const [workerStates, setWorkerStates] = useState({}); // { keyIdx: { store, stage, status, retrying, retryAttempt } }
+  const [workerStates, setWorkerStates] = useState({});
   const deniedKeysRef = useRef(new Set());
 
   const [merchant, setMerchant] = useState("");
@@ -1720,7 +1933,6 @@ export default function VariationEngine() {
   const [batchTotal, setBatchTotal] = useState(0);
   const stopRef = useRef(false);
 
-  // ── Helpers ──
   const updateWorker = useCallback((keyIdx, patch) => {
     setWorkerStates((prev) => ({
       ...prev,
@@ -1773,8 +1985,7 @@ export default function VariationEngine() {
     setDbStatus("idle");
     setCrawlStatus("idle");
     setSaveStatus("idle");
-    let dbData = null,
-      crawledText = "";
+    let dbData = null, crawledText = "";
     if (useDB && merchantSlug) {
       setDbStatus("loading");
       setStatus("Fetching real coupon data from DB…");
@@ -1810,14 +2021,7 @@ export default function VariationEngine() {
       setStatus("Stage 2 — generating content…");
       const data = safeJSON(
         await callGeminiWithBackoff(
-          buildFinalPrompt(
-            merchant,
-            category,
-            research,
-            variation,
-            dbData,
-            url,
-          ),
+          buildFinalPrompt(merchant, category, research, variation, dbData, url),
           apiKey,
           model,
           0,
@@ -1862,10 +2066,7 @@ export default function VariationEngine() {
     setRunning(false);
   };
 
-  // ─── BACKOFF (replaces callWithRetry — no key rotation args needed externally) ───
-  // keyEntry: { k: string, i: number }
-  // onRetry: optional callback(attempt, waitMs) for UI updates
-  // onKeyDenied: optional callback(keyIdx)
+  // ─── BACKOFF ──────────────────────────────────────────────────────
   const callGeminiWithBackoff = async (
     prompt,
     apiKeyStr,
@@ -1894,10 +2095,9 @@ export default function VariationEngine() {
         throw new Error(`Key denied access — removed from rotation`);
       }
       if (isRetryable && attempt < 3) {
-        // Exponential backoff: 10s, 20s, 40s ± up to 2s jitter
         const base = is429 ? 30000 : isHighLoad ? 10000 : 5000;
         const exp = base * Math.pow(2, attempt);
-        const jitter = Math.floor(Math.random() * 4000) - 2000; // ±2s
+        const jitter = Math.floor(Math.random() * 4000) - 2000;
         const wait = Math.max(3000, exp + jitter);
         onRetry?.(attempt + 1, wait);
         await new Promise((res) => setTimeout(res, wait));
@@ -1914,10 +2114,9 @@ export default function VariationEngine() {
     }
   };
 
-  // ─── PROCESS ONE STORE (used by both single worker and retry) ───
+  // ─── PROCESS ONE STORE ────────────────────────────────────────────
   const processStore = async (r, keyEntry) => {
-    let dbData = null,
-      crawledText = "";
+    let dbData = null, crawledText = "";
     if (useDB && r.slug) dbData = await fetchMerchantData(r.slug, backendUrl);
     if (dbData?.contentGenerated) return { skipped: true };
     if (r.url) crawledText = await crawlMerchantSite(r.url, backendUrl);
@@ -1950,7 +2149,6 @@ export default function VariationEngine() {
     );
     const research = safeJSON(researchRaw);
 
-    // Check stop between the two stages — earliest safe exit point
     if (stopRef.current) throw new Error("STOPPED");
 
     updateWorker(keyEntry.i, {
@@ -1998,7 +2196,7 @@ export default function VariationEngine() {
     return { ...data, variation, dbData, savedOk };
   };
 
-  // ─── WORKER POOL BATCH (replaces serial for-loop) ────────────────
+  // ─── WORKER POOL BATCH ────────────────────────────────────────────
   const runBatch = async (rowsOverride = null) => {
     const validKeys = apiKeys
       .map((k, i) => ({ k: k.trim(), i }))
@@ -2030,34 +2228,27 @@ export default function VariationEngine() {
     setRunning(true);
     setBatchTotal(rows.length);
 
-    // Shared queue — index pointer advanced atomically via closure
-    // JS is single-threaded so no true race on this counter
     let queueIdx = 0;
     const getNextRow = () => {
       if (queueIdx >= rows.length) return null;
       return rows[queueIdx++];
     };
 
-    // One async worker per key
     const runWorker = async (keyEntry) => {
       while (true) {
-        // Stop check at top of every iteration
         if (stopRef.current) {
           clearWorker(keyEntry.i);
           break;
         }
-
-        // Deny check — key may have been denied mid-batch
         if (deniedKeysRef.current.has(keyEntry.i)) {
           clearWorker(keyEntry.i);
           break;
         }
-
         const row = getNextRow();
         if (!row) {
           clearWorker(keyEntry.i);
           break;
-        } // queue exhausted
+        }
 
         updateWorker(keyEntry.i, {
           store: row.name,
@@ -2070,7 +2261,6 @@ export default function VariationEngine() {
           const result = await processStore(row, keyEntry);
 
           if (stopRef.current) {
-            // Store finished but stop was requested — still record result, then exit
             if (!result.skipped) {
               setBatchResults((prev) => [
                 ...prev,
@@ -2115,7 +2305,6 @@ export default function VariationEngine() {
             clearWorker(keyEntry.i);
             break;
           }
-
           setBatchResults((prev) => [
             ...prev,
             {
@@ -2130,16 +2319,12 @@ export default function VariationEngine() {
           ]);
           setBatchDone((prev) => prev + 1);
           updateWorker(keyEntry.i, { stage: "error", status: "error" });
-
-          // Brief pause after an error before this worker picks up the next store
-          // Prevents hammering if something systemic is wrong
           if (!stopRef.current)
             await new Promise((res) => setTimeout(res, 2000));
         }
       }
     };
 
-    // Launch all workers concurrently — one per valid key
     await Promise.allSettled(validKeys.map((keyEntry) => runWorker(keyEntry)));
 
     setRunning(false);
@@ -2147,7 +2332,6 @@ export default function VariationEngine() {
     setStatus(stopRef.current ? "Stopped." : "Batch complete.");
   };
 
-  // ── Retry only failed stores ──
   const retryFailed = () => {
     const failed = batchResults.filter((r) => r.status === "error");
     if (!failed.length) return;
@@ -2161,7 +2345,6 @@ export default function VariationEngine() {
     runBatch(rows);
   };
 
-  // ── Load pending ──
   const loadPending = async () => {
     setStatus("Loading pending stores from DB…");
     const data = await fetchPendingMerchants(backendUrl);
@@ -2180,7 +2363,6 @@ export default function VariationEngine() {
     setStatus(`Loaded ${data.merchants.length} pending stores.`);
   };
 
-  // ── Exports ──
   const exportCSV = (results) => {
     const done = results.filter((r) => r.status === "done");
     const headers = [
@@ -2239,14 +2421,7 @@ export default function VariationEngine() {
   const exportFailedCSV = (results) => {
     const failed = results.filter((r) => r.status === "error");
     if (!failed.length) return;
-    const headers = [
-      "merchant",
-      "category",
-      "url",
-      "slug",
-      "error",
-      "key_used",
-    ];
+    const headers = ["merchant", "category", "url", "slug", "error", "key_used"];
     const rows = failed.map((r) =>
       [
         r.merchant,
@@ -2268,7 +2443,6 @@ export default function VariationEngine() {
     a.click();
   };
 
-  // ── Derived ──
   const allContent = output?.sections
     ? Object.values(output.sections)
         .map((s) => (typeof s === "object" ? s.body || "" : s))
@@ -2322,22 +2496,17 @@ export default function VariationEngine() {
         }}
       >
         ⚡ SavingHarbor Variation Engine{" "}
-        <strong>v2.4 — Worker Pool + Smart Backoff</strong>
+        <strong>v2.5 — Tighter FAQs + Wider Heading Spread</strong>
         <br />
         <span style={{ fontSize: 12 }}>
-          384 variations · Live crawl · Real DB coupons · N-key parallel workers
-          · Exponential backoff
+          10 FAQ types (no stacking/howto) · 12-head arrays · h3 depth seed · h3 heading XOR · N-key parallel workers
         </span>
       </div>
 
       {/* Mode toggle */}
       <div style={{ display: "flex", gap: 6, marginBottom: "1rem" }}>
         {["single", "batch"].map((m) => (
-          <button
-            key={m}
-            onClick={() => setMode(m)}
-            style={tabStyle(mode === m)}
-          >
+          <button key={m} onClick={() => setMode(m)} style={tabStyle(mode === m)}>
             {m === "single" ? "Single Merchant" : "Batch Mode (CSV)"}
           </button>
         ))}
@@ -2621,9 +2790,7 @@ export default function VariationEngine() {
                 borderRadius: 12,
                 cursor: "pointer",
                 position: "relative",
-                background: useDB
-                  ? "#1B3557"
-                  : "var(--color-background-tertiary)",
+                background: useDB ? "#1B3557" : "var(--color-background-tertiary)",
                 border: "0.5px solid var(--color-border-secondary)",
                 transition: "background .2s",
               }}
@@ -2816,7 +2983,13 @@ export default function VariationEngine() {
                     paddingLeft: 8,
                   }}
                 >
-                  {i + 1}. {buildHeading(s, merchant, preview.headingStyle.id)}
+                  {i + 1}.{" "}
+                  {buildHeading(
+                    s,
+                    merchant,
+                    preview.headingStyle.id,
+                    preview.headingSeed,
+                  )}
                   <span style={{ marginLeft: 6, fontSize: 10, opacity: 0.6 }}>
                     ({preview.sectionDepths[i]})
                   </span>
@@ -3258,7 +3431,6 @@ export default function VariationEngine() {
             </div>
           )}
 
-          {/* Live worker panel */}
           {running && activeWorkerCount > 0 && (
             <WorkerPanel workers={workerStates} />
           )}
