@@ -1260,7 +1260,7 @@ function buildHeading(section, merchant, headingStyleId, headingSeed = 0) {
 const FAQ_QUESTION_TYPES_LIST = FAQ_QUESTION_TYPES; // alias for clarity below
 
 function getVariation(merchantName, category) {
-  const h  = stableHash(merchantName + "|" + category);
+  const h = stableHash(merchantName + "|" + category);
   const h2 = stableHash(merchantName + "|" + category + "|v2");
   const h3 = stableHash(merchantName + "|" + category + "|v3"); // NEW seed
 
@@ -1271,7 +1271,8 @@ function getVariation(merchantName, category) {
   const faqTypes = [];
   for (let i = 0; i < faqCount; i++) {
     const idx = (h2 >> (i * 4)) % FAQ_QUESTION_TYPES_LIST.length;
-    const pick = FAQ_QUESTION_TYPES_LIST[(idx + i) % FAQ_QUESTION_TYPES_LIST.length];
+    const pick =
+      FAQ_QUESTION_TYPES_LIST[(idx + i) % FAQ_QUESTION_TYPES_LIST.length];
     if (!faqTypes.find((f) => f.id === pick.id)) {
       faqTypes.push(pick);
     } else {
@@ -1378,7 +1379,8 @@ function buildFinalPrompt(
   dbData,
   url,
 ) {
-  const { blueprint, tone, angle, headingStyle, sectionDepths, headingSeed } = variation;
+  const { blueprint, tone, angle, headingStyle, sectionDepths, headingSeed } =
+    variation;
   const ds = buildDiscountSummary(dbData);
   const dbFacts = ds
     ? `
@@ -1397,7 +1399,12 @@ LIVE STORE STATS (mandatory — weave these into content naturally):
 
   const sectionInstructions = blueprint.sections
     .map((s, i) => {
-      const heading = buildHeading(s, merchantName, headingStyle.id, headingSeed);
+      const heading = buildHeading(
+        s,
+        merchantName,
+        headingStyle.id,
+        headingSeed,
+      );
       const depth = sectionDepths[i];
       const wordRange =
         depth === "brief"
@@ -1985,7 +1992,8 @@ export default function VariationEngine() {
     setDbStatus("idle");
     setCrawlStatus("idle");
     setSaveStatus("idle");
-    let dbData = null, crawledText = "";
+    let dbData = null,
+      crawledText = "";
     if (useDB && merchantSlug) {
       setDbStatus("loading");
       setStatus("Fetching real coupon data from DB…");
@@ -2021,7 +2029,14 @@ export default function VariationEngine() {
       setStatus("Stage 2 — generating content…");
       const data = safeJSON(
         await callGeminiWithBackoff(
-          buildFinalPrompt(merchant, category, research, variation, dbData, url),
+          buildFinalPrompt(
+            merchant,
+            category,
+            research,
+            variation,
+            dbData,
+            url,
+          ),
           apiKey,
           model,
           0,
@@ -2116,7 +2131,8 @@ export default function VariationEngine() {
 
   // ─── PROCESS ONE STORE ────────────────────────────────────────────
   const processStore = async (r, keyEntry) => {
-    let dbData = null, crawledText = "";
+    let dbData = null,
+      crawledText = "";
     if (useDB && r.slug) dbData = await fetchMerchantData(r.slug, backendUrl);
     if (dbData?.contentGenerated) return { skipped: true };
     if (r.url) crawledText = await crawlMerchantSite(r.url, backendUrl);
@@ -2421,7 +2437,14 @@ export default function VariationEngine() {
   const exportFailedCSV = (results) => {
     const failed = results.filter((r) => r.status === "error");
     if (!failed.length) return;
-    const headers = ["merchant", "category", "url", "slug", "error", "key_used"];
+    const headers = [
+      "merchant",
+      "category",
+      "url",
+      "slug",
+      "error",
+      "key_used",
+    ];
     const rows = failed.map((r) =>
       [
         r.merchant,
@@ -2499,14 +2522,19 @@ export default function VariationEngine() {
         <strong>v2.5 — Tighter FAQs + Wider Heading Spread</strong>
         <br />
         <span style={{ fontSize: 12 }}>
-          10 FAQ types (no stacking/howto) · 12-head arrays · h3 depth seed · h3 heading XOR · N-key parallel workers
+          10 FAQ types (no stacking/howto) · 12-head arrays · h3 depth seed · h3
+          heading XOR · N-key parallel workers
         </span>
       </div>
 
       {/* Mode toggle */}
       <div style={{ display: "flex", gap: 6, marginBottom: "1rem" }}>
         {["single", "batch"].map((m) => (
-          <button key={m} onClick={() => setMode(m)} style={tabStyle(mode === m)}>
+          <button
+            key={m}
+            onClick={() => setMode(m)}
+            style={tabStyle(mode === m)}
+          >
             {m === "single" ? "Single Merchant" : "Batch Mode (CSV)"}
           </button>
         ))}
@@ -2587,9 +2615,10 @@ export default function VariationEngine() {
                 <option value="gemini-2.5-flash-lite">
                   gemini-2.5-flash-lite (20 RPD)
                 </option>
-                <option value="gemini-2.5-flash">
-                  gemini-2.5-flash (20 RPD)
+                <option value="gemini-3.0-flash">
+                  gemini-3.0-flash (20 RPD)
                 </option>
+                <option value="gemini-3-flash">gemini-3-flash (20 RPD)</option>
               </select>
             </div>
           </div>
@@ -2729,14 +2758,15 @@ export default function VariationEngine() {
                 disabled={running}
               >
                 <option value="gemini-3.1-flash-lite-preview">
-                  gemini-3.1-flash-lite-preview (500 RPD/key)
+                  gemini-3.1-flash-lite-preview (500 RPD)
                 </option>
                 <option value="gemini-2.5-flash-lite">
-                  gemini-2.5-flash-lite (20 RPD/key)
+                  gemini-2.5-flash-lite (20 RPD)
                 </option>
-                <option value="gemini-2.5-flash">
-                  gemini-2.5-flash (20 RPD/key)
+                <option value="gemini-3.0-flash">
+                  gemini-3.0-flash (20 RPD)
                 </option>
+                <option value="gemini-3-flash">gemini-3-flash (20 RPD)</option>
               </select>
             </div>
           </div>
@@ -2790,7 +2820,9 @@ export default function VariationEngine() {
                 borderRadius: 12,
                 cursor: "pointer",
                 position: "relative",
-                background: useDB ? "#1B3557" : "var(--color-background-tertiary)",
+                background: useDB
+                  ? "#1B3557"
+                  : "var(--color-background-tertiary)",
                 border: "0.5px solid var(--color-border-secondary)",
                 transition: "background .2s",
               }}
