@@ -52,6 +52,7 @@ export default function App() {
   const [jobs, setJobs] = useState({});
   const [progress, setProgress] = useState({ done: 0, total: 0 });
   const abortRef = useRef(false);
+  const bucketRef = useRef({ tokens: 1, last: Date.now() });
 
   // Review
   const [approved, setApproved] = useState({});
@@ -92,6 +93,30 @@ export default function App() {
     setCommitResult(null);
   };
 
+  const acquireToken = useCallback(() => {
+    const RATE = 2.5; // tokens/sec — 10 keys × 15 RPM / 60
+    const MAX = 5; // burst buffer
+    return new Promise((resolve) => {
+      const tryAcquire = () => {
+        const bucket = bucketRef.current;
+        const now = Date.now();
+        const elapsed = (now - bucket.last) / 1000;
+        bucket.tokens = Math.min(MAX, bucket.tokens + elapsed * RATE);
+        bucket.last = now;
+
+        if (bucket.tokens >= 1) {
+          bucket.tokens -= 1;
+          resolve();
+        } else {
+          // Wait until next token is available, then retry
+          const wait = Math.ceil(((1 - bucket.tokens) / RATE) * 1000);
+          setTimeout(tryAcquire, wait);
+        }
+      };
+      tryAcquire();
+    });
+  }, []);
+
   // ── Run classification ───────────────────────────────────────────────────────
   const runClassification = useCallback(async () => {
     if (!merchants.length || !validKeys.length) return;
@@ -102,6 +127,7 @@ export default function App() {
     let idx = 0;
 
     const worker = async (geminiKey) => {
+      await new Promise((r) => setTimeout(r, Math.random() * 400));
       while (idx < merchants.length) {
         if (abortRef.current) break;
         const merchant = merchants[idx++];
@@ -110,7 +136,7 @@ export default function App() {
           ...j,
           [merchant.id]: { status: "scraping", merchant },
         }));
-
+        await acquireToken();
         try {
           const res = await post("/classify", {
             geminiKey,
