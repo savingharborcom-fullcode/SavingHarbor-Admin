@@ -2,6 +2,7 @@ import { useState, useCallback, useRef } from "react";
 
 const API = "https://admin-api.savingharbor.com/api/classifier";
 
+const get = (path) => fetch(`${API}${path}`).then((r) => r.json());
 const post = (path, body) =>
   fetch(`${API}${path}`, {
     method: "POST",
@@ -9,99 +10,95 @@ const post = (path, body) =>
     body: JSON.stringify(body),
   }).then((r) => r.json());
 
-const TABS = ["Config", "Run", "Review", "Results"];
+const TABS = ["Classifier", "Review", "Results"];
 
 const STATUS = {
-  idle: { label: "Idle", color: "#6b7280" },
-  pending: { label: "Queued", color: "#d97706" },
   scraping: { label: "Scraping", color: "#3b82f6" },
   classifying: { label: "Classifying", color: "#8b5cf6" },
-  done: { label: "Done", color: "#10b981" },
+  done: { label: "Matched", color: "#10b981" },
   mismatch: { label: "Mismatch", color: "#ef4444" },
   error: { label: "Error", color: "#f97316" },
 };
 
 export default function App() {
-  const [tab, setTab] = useState("Config");
+  const [tab, setTab] = useState("Classifier");
 
-  // Config
-  const [db, setDb] = useState({
-    host: "",
-    port: "5432",
-    database: "",
-    user: "",
-    password: "",
-    ssl: true,
-  });
-  const [geminiKey, setGeminiKey] = useState("");
+  // Keys & model
+  const [keys, setKeys] = useState([""]);
   const [model, setModel] = useState("gemini-3.1-flash-lite-preview");
-  const [batchSize] = useState(500);
+
+  // Filters & batch
   const [filter, setFilter] = useState({
     onlyActive: false,
     onlyPublished: false,
   });
-  const [dbOk, setDbOk] = useState(null);
+  const [batchSize] = useState(500);
+  const [offset, setOffset] = useState(0);
+  const [totalMerchants, setTotalMerchants] = useState(0);
 
   // Data
   const [categories, setCategories] = useState([]);
   const [merchants, setMerchants] = useState([]);
-  const [totalMerchants, setTotalMerchants] = useState(0);
-  const [offset, setOffset] = useState(0);
 
-  // Run
+  // Run state
   const [running, setRunning] = useState(false);
-  const [jobs, setJobs] = useState({}); // id -> { status, classification, merchant, changed }
+  const [jobs, setJobs] = useState({});
   const [progress, setProgress] = useState({ done: 0, total: 0 });
   const abortRef = useRef(false);
 
   // Review
-  const [approved, setApproved] = useState({}); // id -> bool
-  const [newCatQueue, setNewCatQueue] = useState([]); // pending new category creates
+  const [approved, setApproved] = useState({});
+  const [newCatQueue, setNewCatQueue] = useState([]);
 
   // Results
   const [commitResult, setCommitResult] = useState(null);
 
-  // ── Config ──────────────────────────────────────────────────────────────────
-  const testConnection = async () => {
-    setDbOk(null);
-    const r = await post("/test-connection", db);
-    setDbOk(r.ok);
-    if (r.ok) {
-      const catRes = await post("/categories", { db });
-      setCategories(catRes.categories || []);
-    }
-  };
+  // ── Key management ───────────────────────────────────────────────────────────
+  const addKey = () => setKeys((k) => [...k, ""]);
+  const removeKey = (i) => setKeys((k) => k.filter((_, idx) => idx !== i));
+  const updateKey = (i, val) =>
+    setKeys((k) => k.map((v, idx) => (idx === i ? val : v)));
+  const validKeys = keys.filter((k) => k.trim());
 
+  // ── Load batch ───────────────────────────────────────────────────────────────
   const loadBatch = async (off = 0) => {
-    const res = await post("/merchants/batch", {
-      db,
+    const params = new URLSearchParams({
       offset: off,
       limit: batchSize,
-      filter,
+      onlyActive: filter.onlyActive,
+      onlyPublished: filter.onlyPublished,
     });
-    setMerchants(res.merchants || []);
-    setTotalMerchants(res.total || 0);
+
+    const [catRes, merRes] = await Promise.all([
+      get("/categories"),
+      get(`/merchants/batch?${params}`),
+    ]);
+
+    setCategories(catRes.categories || []);
+    setMerchants(merRes.merchants || []);
+    setTotalMerchants(merRes.total || 0);
     setOffset(off);
     setJobs({});
-    setProgress({ done: 0, total: res.merchants?.length || 0 });
+    setProgress({ done: 0, total: merRes.merchants?.length || 0 });
     setApproved({});
     setCommitResult(null);
   };
 
-  // ── Run ──────────────────────────────────────────────────────────────────────
+  // ── Run classification ───────────────────────────────────────────────────────
   const runClassification = useCallback(async () => {
-    if (!merchants.length) return;
+    if (!merchants.length || !validKeys.length) return;
     abortRef.current = false;
     setRunning(true);
     setProgress({ done: 0, total: merchants.length });
 
-    const CONCURRENCY = 3;
     let idx = 0;
+    const concurrency = validKeys.length; // one worker per key
 
-    const worker = async () => {
+    const worker = async (geminiKey) => {
       while (idx < merchants.length) {
         if (abortRef.current) break;
         const merchant = merchants[idx++];
+
         setJobs((j) => ({
           ...j,
           [merchant.id]: { status: "scraping", merchant },
@@ -109,7 +106,6 @@ export default function App() {
 
         try {
           const res = await post("/classify", {
-            db,
             geminiKey,
             model,
             merchant,
@@ -129,13 +125,11 @@ export default function App() {
           }));
 
           if (res.changed) {
-            setApproved((a) => ({ ...a, [merchant.id]: true })); // default approve
-
-            // Queue new category creation prompts
+            setApproved((a) => ({ ...a, [merchant.id]: true }));
             if (
               res.classification.needs_new_category &&
               res.classification.new_category
-            ) {
+            )
               setNewCatQueue((q) => [
                 ...q,
                 {
@@ -144,11 +138,10 @@ export default function App() {
                   type: "category",
                 },
               ]);
-            }
             if (
               res.classification.needs_new_subcategory &&
               res.classification.new_subcategory
-            ) {
+            )
               setNewCatQueue((q) => [
                 ...q,
                 {
@@ -157,7 +150,6 @@ export default function App() {
                   type: "subcategory",
                 },
               ]);
-            }
           }
         } catch (e) {
           setJobs((j) => ({
@@ -170,36 +162,27 @@ export default function App() {
       }
     };
 
-    await Promise.all(Array.from({ length: CONCURRENCY }, worker));
+    await Promise.all(validKeys.map((key) => worker(key)));
     setRunning(false);
-  }, [merchants, db, geminiKey, model, categories]);
+  }, [merchants, validKeys, model, categories]);
 
-  const stopRun = () => {
-    abortRef.current = true;
-  };
-
-  // ── Review ───────────────────────────────────────────────────────────────────
-  const mismatches = Object.values(jobs).filter((j) => j.changed);
-
+  // ── Commit ───────────────────────────────────────────────────────────────────
   const commitApproved = async () => {
-    const corrections = mismatches
-      .filter((j) => approved[j.merchant.id])
+    const corrections = Object.values(jobs)
+      .filter((j) => j.changed && approved[j.merchant.id])
       .map((j) => ({
         id: j.merchant.id,
         category_id: j.classification.category_id,
         subcategory_id: j.classification.subcategory_id,
       }));
     if (!corrections.length) return;
-    const res = await post("/merchants/update", { db, corrections });
+    const res = await post("/merchants/update", { corrections });
     setCommitResult(res);
     setTab("Results");
   };
 
   const createCategory = async (item) => {
-    const res = await post("/categories/create", {
-      db,
-      category: item.suggestion,
-    });
+    const res = await post("/categories/create", { category: item.suggestion });
     if (res.category) {
       setCategories((c) => [...c, res.category]);
       setNewCatQueue((q) => q.filter((x) => x !== item));
@@ -207,11 +190,18 @@ export default function App() {
   };
 
   // ── Helpers ──────────────────────────────────────────────────────────────────
-  const catName = (id) => categories.find((c) => c.id === id)?.name || `#${id}`;
-
+  const catName = (id) =>
+    categories.find((c) => c.id === id)?.name || (id ? `#${id}` : "—");
   const pct = progress.total
     ? Math.round((progress.done / progress.total) * 100)
     : 0;
+  const mismatches = Object.values(jobs).filter((j) => j.changed);
+  const approvedCount = Object.values(approved).filter(Boolean).length;
+
+  const statusCounts = Object.values(jobs).reduce((acc, j) => {
+    acc[j.status] = (acc[j.status] || 0) + 1;
+    return acc;
+  }, {});
 
   // ── Render ───────────────────────────────────────────────────────────────────
   return (
@@ -219,7 +209,6 @@ export default function App() {
       <header style={S.header}>
         <span style={S.logo}>⬡</span>
         <span style={S.title}>Merchant Category Classifier</span>
-        <span style={S.sub}>Powered by Gemini</span>
       </header>
 
       <nav style={S.nav}>
@@ -238,150 +227,113 @@ export default function App() {
       </nav>
 
       <main style={S.main}>
-        {/* ── CONFIG TAB ── */}
-        {tab === "Config" && (
-          <div style={S.card}>
-            <h2 style={S.cardTitle}>Database Connection</h2>
-            <div style={S.grid2}>
-              {[
-                ["Host", "host", "db-host.example.com"],
-                ["Port", "port", "5432"],
-                ["Database", "database", "mydb"],
-                ["User", "user", "postgres"],
-              ].map(([label, key, ph]) => (
-                <label key={key} style={S.label}>
-                  {label}
-                  <input
-                    style={S.input}
-                    placeholder={ph}
-                    value={db[key]}
-                    onChange={(e) =>
-                      setDb((d) => ({ ...d, [key]: e.target.value }))
-                    }
-                  />
-                </label>
-              ))}
-              <label style={S.label}>
-                Password
-                <input
-                  style={S.input}
-                  type="password"
-                  value={db.password}
-                  onChange={(e) =>
-                    setDb((d) => ({ ...d, password: e.target.value }))
-                  }
-                />
-              </label>
-              <label
-                style={{
-                  ...S.label,
-                  flexDirection: "row",
-                  alignItems: "center",
-                  gap: 10,
-                }}
-              >
-                <input
-                  type="checkbox"
-                  checked={db.ssl}
-                  onChange={(e) =>
-                    setDb((d) => ({ ...d, ssl: e.target.checked }))
-                  }
-                />
-                SSL
-              </label>
-            </div>
-            <button style={S.btn} onClick={testConnection}>
-              Test Connection
-            </button>
-            {dbOk === true && (
-              <p style={{ color: "#10b981", marginTop: 8 }}>
-                ✓ Connected — {categories.length} categories loaded
-              </p>
-            )}
-            {dbOk === false && (
-              <p style={{ color: "#ef4444", marginTop: 8 }}>
-                ✗ Connection failed
-              </p>
-            )}
-
-            <h2 style={{ ...S.cardTitle, marginTop: 32 }}>Gemini API</h2>
-            <label style={S.label}>
-              API Key
-              <input
-                style={S.input}
-                type="password"
-                value={geminiKey}
-                onChange={(e) => setGeminiKey(e.target.value)}
-                placeholder="AIza..."
-              />
-            </label>
-            <label style={S.label}>
-              Model
-              <select
-                style={S.input}
-                value={model}
-                onChange={(e) => setModel(e.target.value)}
-              >
-                <option value="gemini-3.1-flash-lite-preview">
-                  gemini-3.1-flash-lite-preview (500 RPD)
-                </option>
-                <option value="gemini-2.5-flash-lite">
-                  gemini-2.5-flash-lite (20 RPD)
-                </option>
-                <option value="gemini-3.0-flash">
-                  gemini-3.0-flash (20 RPD)
-                </option>
-                <option value="gemini-3-flash">gemini-3-flash (20 RPD)</option>
-              </select>
-            </label>
-
-            <h2 style={{ ...S.cardTitle, marginTop: 32 }}>Batch Filters</h2>
-            <div style={{ display: "flex", gap: 24 }}>
-              {[
-                ["onlyActive", "Active merchants only"],
-                ["onlyPublished", "Published only"],
-              ].map(([k, label]) => (
-                <label
-                  key={k}
-                  style={{
-                    ...S.label,
-                    flexDirection: "row",
-                    alignItems: "center",
-                    gap: 8,
-                  }}
-                >
-                  <input
-                    type="checkbox"
-                    checked={filter[k]}
-                    onChange={(e) =>
-                      setFilter((f) => ({ ...f, [k]: e.target.checked }))
-                    }
-                  />
-                  {label}
-                </label>
-              ))}
-            </div>
-          </div>
-        )}
-
-        {/* ── RUN TAB ── */}
-        {tab === "Run" && (
-          <div>
+        {/* ── CLASSIFIER TAB ── */}
+        {tab === "Classifier" && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+            {/* Keys + Model */}
             <div style={S.card}>
-              <h2 style={S.cardTitle}>Batch Control</h2>
               <div
                 style={{
                   display: "flex",
-                  gap: 12,
+                  justifyContent: "space-between",
+                  alignItems: "center",
+                  marginBottom: 14,
+                }}
+              >
+                <h2 style={S.cardTitle}>Gemini API Keys</h2>
+                <button style={S.btnSmall} onClick={addKey}>
+                  + Add Key
+                </button>
+              </div>
+              <div
+                style={{
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: 8,
+                  marginBottom: 16,
+                }}
+              >
+                {keys.map((k, i) => (
+                  <div
+                    key={i}
+                    style={{ display: "flex", gap: 8, alignItems: "center" }}
+                  >
+                    <span style={S.keyTag}>Key {i + 1}</span>
+                    <input
+                      style={{ ...S.input, flex: 1, fontFamily: "monospace" }}
+                      type="password"
+                      placeholder="AIza..."
+                      value={k}
+                      onChange={(e) => updateKey(i, e.target.value)}
+                    />
+                    {keys.length > 1 && (
+                      <button style={S.btnGhostSm} onClick={() => removeKey(i)}>
+                        ✕
+                      </button>
+                    )}
+                  </div>
+                ))}
+              </div>
+              <label style={S.label}>
+                Model
+                <select
+                  style={S.input}
+                  value={model}
+                  onChange={(e) => setModel(e.target.value)}
+                >
+                  <option value="gemini-3.1-flash-lite-preview">
+                    gemini-3.1-flash-lite-preview (500 RPD)
+                  </option>
+                  <option value="gemini-2.5-flash-lite">
+                    gemini-2.5-flash-lite (20 RPD)
+                  </option>
+                  <option value="gemini-3.0-flash">
+                    gemini-3.0-flash (20 RPD)
+                  </option>
+                  <option value="gemini-3-flash">
+                    gemini-3-flash (20 RPD)
+                  </option>
+                </select>
+              </label>
+            </div>
+
+            {/* Filters + Load */}
+            <div style={S.card}>
+              <h2 style={S.cardTitle}>Batch</h2>
+              <div style={{ display: "flex", gap: 24, marginBottom: 16 }}>
+                {[
+                  ["onlyActive", "Active only"],
+                  ["onlyPublished", "Published only"],
+                ].map(([k, label]) => (
+                  <label
+                    key={k}
+                    style={{
+                      ...S.label,
+                      flexDirection: "row",
+                      alignItems: "center",
+                      gap: 8,
+                    }}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={filter[k]}
+                      onChange={(e) =>
+                        setFilter((f) => ({ ...f, [k]: e.target.checked }))
+                      }
+                    />
+                    {label}
+                  </label>
+                ))}
+              </div>
+              <div
+                style={{
+                  display: "flex",
+                  gap: 10,
                   alignItems: "center",
                   flexWrap: "wrap",
                 }}
               >
-                <button
-                  style={S.btn}
-                  onClick={() => loadBatch(0)}
-                  disabled={!dbOk}
-                >
+                <button style={S.btn} onClick={() => loadBatch(0)}>
                   Load First {batchSize}
                 </button>
                 {offset > 0 && (
@@ -400,133 +352,165 @@ export default function App() {
                     Next →
                   </button>
                 )}
-                <span style={{ color: "#9ca3af", fontSize: 13 }}>
-                  {merchants.length > 0 &&
-                    `Showing ${offset + 1}–${offset + merchants.length} of ${totalMerchants}`}
-                </span>
+                {merchants.length > 0 && (
+                  <span style={{ color: "#6b7280", fontSize: 12 }}>
+                    {offset + 1}–{offset + merchants.length} of {totalMerchants}
+                  </span>
+                )}
               </div>
+            </div>
 
-              {merchants.length > 0 && (
-                <div style={{ marginTop: 20 }}>
-                  <div style={S.progressBar}>
-                    <div style={{ ...S.progressFill, width: `${pct}%` }} />
-                  </div>
-                  <div
-                    style={{
-                      display: "flex",
-                      justifyContent: "space-between",
-                      fontSize: 12,
-                      color: "#9ca3af",
-                      marginTop: 4,
-                    }}
-                  >
-                    <span>
-                      {progress.done} / {progress.total} processed
-                    </span>
-                    <span>{pct}%</span>
-                  </div>
-
-                  <div style={{ display: "flex", gap: 12, marginTop: 16 }}>
+            {/* Progress + Run */}
+            {merchants.length > 0 && (
+              <div style={S.card}>
+                <div
+                  style={{
+                    display: "flex",
+                    justifyContent: "space-between",
+                    alignItems: "center",
+                    marginBottom: 14,
+                  }}
+                >
+                  <h2 style={S.cardTitle}>
+                    Run — {validKeys.length} key
+                    {validKeys.length !== 1 ? "s" : ""} · {validKeys.length}{" "}
+                    parallel worker{validKeys.length !== 1 ? "s" : ""}
+                  </h2>
+                  <div style={{ display: "flex", gap: 8 }}>
                     <button
                       style={S.btn}
                       onClick={runClassification}
-                      disabled={running}
+                      disabled={running || !validKeys.length}
                     >
-                      {running ? "Running…" : "▶ Run Classification"}
+                      {running ? "Running…" : "▶ Start"}
                     </button>
                     {running && (
-                      <button style={S.btnDanger} onClick={stopRun}>
+                      <button
+                        style={S.btnDanger}
+                        onClick={() => {
+                          abortRef.current = true;
+                        }}
+                      >
                         ■ Stop
                       </button>
                     )}
                   </div>
-
-                  <div
-                    style={{
-                      display: "flex",
-                      gap: 16,
-                      marginTop: 16,
-                      fontSize: 13,
-                    }}
-                  >
-                    {Object.entries(
-                      Object.values(jobs).reduce((acc, j) => {
-                        acc[j.status] = (acc[j.status] || 0) + 1;
-                        return acc;
-                      }, {}),
-                    ).map(([status, count]) => (
-                      <span
-                        key={status}
-                        style={{ color: STATUS[status]?.color || "#fff" }}
-                      >
-                        {STATUS[status]?.label || status}: {count}
-                      </span>
-                    ))}
-                  </div>
                 </div>
-              )}
-            </div>
 
-            {/* Job list */}
+                <div style={S.progressBar}>
+                  <div style={{ ...S.progressFill, width: `${pct}%` }} />
+                </div>
+                <div
+                  style={{
+                    display: "flex",
+                    justifyContent: "space-between",
+                    fontSize: 11,
+                    color: "#6b7280",
+                    marginTop: 4,
+                    marginBottom: 12,
+                  }}
+                >
+                  <span>
+                    {progress.done} / {progress.total}
+                  </span>
+                  <span>{pct}%</span>
+                </div>
+
+                <div style={{ display: "flex", gap: 16, flexWrap: "wrap" }}>
+                  {Object.entries(statusCounts).map(([status, count]) => (
+                    <span
+                      key={status}
+                      style={{
+                        fontSize: 12,
+                        color: STATUS[status]?.color || "#9ca3af",
+                      }}
+                    >
+                      {STATUS[status]?.label || status}:{" "}
+                      <strong>{count}</strong>
+                    </span>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Job table */}
             {Object.values(jobs).length > 0 && (
-              <div
-                style={{
-                  ...S.card,
-                  marginTop: 16,
-                  maxHeight: 420,
-                  overflowY: "auto",
-                }}
-              >
-                <table style={S.table}>
-                  <thead>
-                    <tr>
-                      {[
-                        "ID",
-                        "Store",
-                        "Status",
-                        "Old Cat",
-                        "New Cat",
-                        "Confidence",
-                        "Note",
-                      ].map((h) => (
-                        <th key={h} style={S.th}>
-                          {h}
-                        </th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {Object.values(jobs).map((j) => (
-                      <tr
-                        key={j.merchant.id}
-                        style={{ borderBottom: "1px solid #1f2937" }}
-                      >
-                        <td style={S.td}>{j.merchant.id}</td>
-                        <td style={S.td}>{j.merchant.name}</td>
-                        <td style={{ ...S.td, color: STATUS[j.status]?.color }}>
-                          {STATUS[j.status]?.label}
-                        </td>
-                        <td style={S.td}>{catName(j.merchant.category_id)}</td>
-                        <td style={S.td}>
-                          {j.classification
-                            ? catName(j.classification.category_id)
-                            : "—"}
-                        </td>
-                        <td style={S.td}>
-                          {j.classification
-                            ? `${Math.round(j.classification.confidence * 100)}%`
-                            : "—"}
-                        </td>
-                        <td style={{ ...S.td, fontSize: 11, color: "#9ca3af" }}>
-                          {j.classification?.reasoning ||
-                            j.error ||
-                            j.scrapeError ||
-                            ""}
-                        </td>
+              <div style={{ ...S.card, padding: 0, overflow: "hidden" }}>
+                <div style={{ maxHeight: 480, overflowY: "auto" }}>
+                  <table style={S.table}>
+                    <thead
+                      style={{
+                        position: "sticky",
+                        top: 0,
+                        background: "#0d1117",
+                        zIndex: 1,
+                      }}
+                    >
+                      <tr>
+                        {[
+                          "ID",
+                          "Store",
+                          "Status",
+                          "Current Cat",
+                          "→ New Cat",
+                          "Conf",
+                          "Note",
+                        ].map((h) => (
+                          <th key={h} style={S.th}>
+                            {h}
+                          </th>
+                        ))}
                       </tr>
-                    ))}
-                  </tbody>
-                </table>
+                    </thead>
+                    <tbody>
+                      {Object.values(jobs).map((j) => (
+                        <tr
+                          key={j.merchant.id}
+                          style={{ borderBottom: "1px solid #1a2235" }}
+                        >
+                          <td style={S.td}>{j.merchant.id}</td>
+                          <td style={S.td}>{j.merchant.name}</td>
+                          <td
+                            style={{ ...S.td, color: STATUS[j.status]?.color }}
+                          >
+                            {STATUS[j.status]?.label}
+                          </td>
+                          <td style={{ ...S.td, color: "#6b7280" }}>
+                            {catName(j.merchant.category_id)}
+                          </td>
+                          <td
+                            style={{
+                              ...S.td,
+                              color: j.changed ? "#10b981" : "#6b7280",
+                            }}
+                          >
+                            {j.classification
+                              ? catName(j.classification.category_id)
+                              : "—"}
+                          </td>
+                          <td style={S.td}>
+                            {j.classification
+                              ? `${Math.round(j.classification.confidence * 100)}%`
+                              : "—"}
+                          </td>
+                          <td
+                            style={{
+                              ...S.td,
+                              fontSize: 11,
+                              color: "#6b7280",
+                              maxWidth: 220,
+                            }}
+                          >
+                            {j.classification?.reasoning ||
+                              j.error ||
+                              j.scrapeError ||
+                              ""}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
               </div>
             )}
           </div>
@@ -534,38 +518,46 @@ export default function App() {
 
         {/* ── REVIEW TAB ── */}
         {tab === "Review" && (
-          <div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
             {newCatQueue.length > 0 && (
-              <div
-                style={{ ...S.card, borderColor: "#d97706", marginBottom: 16 }}
-              >
-                <h2 style={{ ...S.cardTitle, color: "#d97706" }}>
+              <div style={{ ...S.card, borderColor: "#92400e" }}>
+                <h2
+                  style={{ ...S.cardTitle, color: "#d97706", marginBottom: 12 }}
+                >
                   ⚠ New Category Suggestions ({newCatQueue.length})
                 </h2>
                 {newCatQueue.map((item, i) => (
-                  <div key={i} style={S.newCatRow}>
-                    <div>
-                      <strong style={{ color: "#f3f4f6" }}>
+                  <div
+                    key={i}
+                    style={{
+                      display: "flex",
+                      alignItems: "flex-start",
+                      gap: 10,
+                      padding: "10px 0",
+                      borderBottom: "1px solid #1a2235",
+                    }}
+                  >
+                    <div style={{ flex: 1 }}>
+                      <strong style={{ color: "#f3f4f6", fontSize: 13 }}>
                         {item.type === "category"
                           ? "New Category"
                           : "New Subcategory"}
                       </strong>
                       <span
                         style={{
-                          color: "#9ca3af",
+                          color: "#6b7280",
+                          fontSize: 11,
                           marginLeft: 8,
-                          fontSize: 12,
                         }}
                       >
                         for: {item.merchant.name}
                       </span>
                       <div
-                        style={{ fontSize: 13, color: "#d1d5db", marginTop: 4 }}
+                        style={{ fontSize: 12, color: "#9ca3af", marginTop: 4 }}
                       >
-                        Name: {item.suggestion.name} · Slug:{" "}
-                        {item.suggestion.slug}
+                        {item.suggestion.name} · {item.suggestion.slug}
                         {item.suggestion.parent_id &&
-                          ` · Parent: ${catName(item.suggestion.parent_id)}`}
+                          ` · parent: ${catName(item.suggestion.parent_id)}`}
                       </div>
                     </div>
                     <button
@@ -593,7 +585,7 @@ export default function App() {
                   display: "flex",
                   justifyContent: "space-between",
                   alignItems: "center",
-                  marginBottom: 16,
+                  marginBottom: 14,
                 }}
               >
                 <h2 style={S.cardTitle}>
@@ -616,35 +608,41 @@ export default function App() {
                     Reject All
                   </button>
                   <button
-                    style={{ ...S.btn, marginLeft: 8 }}
+                    style={{ ...S.btn, marginLeft: 4 }}
                     onClick={commitApproved}
-                    disabled={!Object.values(approved).some(Boolean)}
+                    disabled={!approvedCount}
                   >
-                    Commit {Object.values(approved).filter(Boolean).length}{" "}
-                    Updates
+                    Commit {approvedCount}
                   </button>
                 </div>
               </div>
 
               {mismatches.length === 0 ? (
-                <p style={{ color: "#6b7280" }}>
-                  No mismatches found. Run classification first.
+                <p style={{ color: "#4b5563" }}>
+                  No mismatches. Run classification first.
                 </p>
               ) : (
-                <div style={{ maxHeight: 520, overflowY: "auto" }}>
+                <div style={{ maxHeight: 560, overflowY: "auto" }}>
                   <table style={S.table}>
-                    <thead>
+                    <thead
+                      style={{
+                        position: "sticky",
+                        top: 0,
+                        background: "#0d1117",
+                        zIndex: 1,
+                      }}
+                    >
                       <tr>
                         {[
-                          "Approve",
+                          "✓",
                           "ID",
                           "Store",
-                          "Old Category",
+                          "Old Cat",
                           "Old Sub",
-                          "→ New Category",
-                          "→ New Sub",
+                          "→ Cat",
+                          "→ Sub",
                           "Conf",
-                          "Reasoning",
+                          "Reason",
                         ].map((h) => (
                           <th key={h} style={S.th}>
                             {h}
@@ -656,7 +654,7 @@ export default function App() {
                       {mismatches.map((j) => (
                         <tr
                           key={j.merchant.id}
-                          style={{ borderBottom: "1px solid #1f2937" }}
+                          style={{ borderBottom: "1px solid #1a2235" }}
                         >
                           <td style={S.td}>
                             <input
@@ -672,10 +670,10 @@ export default function App() {
                           </td>
                           <td style={S.td}>{j.merchant.id}</td>
                           <td style={S.td}>{j.merchant.name}</td>
-                          <td style={{ ...S.td, color: "#9ca3af" }}>
+                          <td style={{ ...S.td, color: "#6b7280" }}>
                             {catName(j.merchant.category_id)}
                           </td>
-                          <td style={{ ...S.td, color: "#9ca3af" }}>
+                          <td style={{ ...S.td, color: "#6b7280" }}>
                             {catName(j.merchant.subcategory_id)}
                           </td>
                           <td style={{ ...S.td, color: "#10b981" }}>
@@ -691,7 +689,7 @@ export default function App() {
                             style={{
                               ...S.td,
                               fontSize: 11,
-                              color: "#9ca3af",
+                              color: "#6b7280",
                               maxWidth: 200,
                             }}
                           >
@@ -712,12 +710,12 @@ export default function App() {
           <div style={S.card}>
             <h2 style={S.cardTitle}>Commit Results</h2>
             {!commitResult ? (
-              <p style={{ color: "#6b7280" }}>
-                No commit yet. Approve and commit from the Review tab.
+              <p style={{ color: "#4b5563" }}>
+                No commit yet. Approve and commit from Review.
               </p>
             ) : (
               <>
-                <div style={{ display: "flex", gap: 32, marginBottom: 24 }}>
+                <div style={{ display: "flex", gap: 40, marginBottom: 24 }}>
                   <div style={S.stat}>
                     <span style={{ ...S.statNum, color: "#10b981" }}>
                       {commitResult.updated?.length || 0}
@@ -734,17 +732,25 @@ export default function App() {
 
                 {commitResult.updated?.length > 0 && (
                   <>
-                    <h3 style={{ color: "#10b981", marginBottom: 8 }}>
+                    <h3
+                      style={{
+                        color: "#10b981",
+                        fontSize: 12,
+                        marginBottom: 8,
+                        letterSpacing: "0.05em",
+                        textTransform: "uppercase",
+                      }}
+                    >
                       Updated Store IDs
                     </h3>
                     <div style={S.idBox}>{commitResult.updated.join(", ")}</div>
                     <button
                       style={{ ...S.btnGhost, marginTop: 8 }}
-                      onClick={() => {
+                      onClick={() =>
                         navigator.clipboard.writeText(
                           commitResult.updated.join(", "),
-                        );
-                      }}
+                        )
+                      }
                     >
                       Copy IDs
                     </button>
@@ -756,8 +762,11 @@ export default function App() {
                     <h3
                       style={{
                         color: "#ef4444",
-                        marginTop: 16,
+                        fontSize: 12,
+                        marginTop: 20,
                         marginBottom: 8,
+                        letterSpacing: "0.05em",
+                        textTransform: "uppercase",
                       }}
                     >
                       Failed
@@ -765,7 +774,11 @@ export default function App() {
                     {commitResult.failed.map((f) => (
                       <div
                         key={f.id}
-                        style={{ fontSize: 12, color: "#f97316" }}
+                        style={{
+                          fontSize: 12,
+                          color: "#f97316",
+                          marginBottom: 4,
+                        }}
                       >
                         ID {f.id}: {f.error}
                       </div>
@@ -781,48 +794,39 @@ export default function App() {
   );
 }
 
-// ── Styles ────────────────────────────────────────────────────────────────────
 const S = {
   root: {
     minHeight: "100vh",
-    background: "#030712",
-    color: "#f3f4f6",
+    background: "#060d1a",
+    color: "#e5e7eb",
     fontFamily: "'DM Mono', 'Fira Code', monospace",
     fontSize: 14,
   },
   header: {
     display: "flex",
     alignItems: "center",
-    gap: 12,
-    padding: "18px 28px",
+    gap: 10,
+    padding: "16px 24px",
     borderBottom: "1px solid #111827",
-    background: "#050c1a",
+    background: "#040b16",
   },
-  logo: { fontSize: 24, color: "#3b82f6" },
-  title: {
-    fontWeight: 700,
-    fontSize: 16,
-    letterSpacing: "0.05em",
-    color: "#f9fafb",
-  },
-  sub: { fontSize: 11, color: "#4b5563", marginLeft: "auto" },
+  logo: { fontSize: 20, color: "#3b82f6" },
+  title: { fontWeight: 700, fontSize: 15, letterSpacing: "0.06em" },
   nav: {
     display: "flex",
-    gap: 2,
-    padding: "0 24px",
-    background: "#050c1a",
+    padding: "0 20px",
+    background: "#040b16",
     borderBottom: "1px solid #111827",
   },
   navBtn: {
-    padding: "10px 18px",
+    padding: "10px 16px",
     background: "none",
     border: "none",
     color: "#6b7280",
     cursor: "pointer",
     fontSize: 13,
-    letterSpacing: "0.04em",
-    position: "relative",
     borderBottom: "2px solid transparent",
+    position: "relative",
   },
   navActive: { color: "#3b82f6", borderBottom: "2px solid #3b82f6" },
   badge: {
@@ -830,43 +834,39 @@ const S = {
     color: "#fff",
     borderRadius: 9,
     fontSize: 10,
-    padding: "1px 6px",
-    marginLeft: 6,
+    padding: "1px 5px",
+    marginLeft: 5,
   },
-  main: { padding: 24, maxWidth: 1200, margin: "0 auto" },
+  main: { padding: 20, maxWidth: 1280, margin: "0 auto" },
   card: {
-    background: "#0d1117",
-    border: "1px solid #1f2937",
+    background: "#0b1220",
+    border: "1px solid #1a2235",
     borderRadius: 8,
-    padding: 24,
+    padding: 20,
   },
   cardTitle: {
-    fontSize: 14,
+    fontSize: 11,
     fontWeight: 600,
-    color: "#e5e7eb",
-    marginBottom: 16,
-    letterSpacing: "0.05em",
+    color: "#6b7280",
+    letterSpacing: "0.08em",
     textTransform: "uppercase",
+    margin: 0,
+    marginBottom: 0,
   },
-  grid2: {
-    display: "grid",
-    gridTemplateColumns: "1fr 1fr",
-    gap: 16,
-    marginBottom: 16,
-  },
+  keyTag: { fontSize: 11, color: "#4b5563", minWidth: 40 },
   label: {
     display: "flex",
     flexDirection: "column",
     gap: 6,
     fontSize: 12,
-    color: "#9ca3af",
+    color: "#6b7280",
   },
   input: {
-    background: "#111827",
-    border: "1px solid #1f2937",
+    background: "#0d1526",
+    border: "1px solid #1a2235",
     borderRadius: 6,
-    padding: "8px 12px",
-    color: "#f3f4f6",
+    padding: "8px 10px",
+    color: "#e5e7eb",
     fontSize: 13,
     outline: "none",
     fontFamily: "inherit",
@@ -876,18 +876,17 @@ const S = {
     color: "#fff",
     border: "none",
     borderRadius: 6,
-    padding: "9px 18px",
+    padding: "8px 16px",
     cursor: "pointer",
     fontSize: 13,
     fontWeight: 600,
-    letterSpacing: "0.03em",
   },
   btnGhost: {
     background: "none",
     color: "#6b7280",
-    border: "1px solid #374151",
+    border: "1px solid #1f2937",
     borderRadius: 6,
-    padding: "9px 18px",
+    padding: "8px 14px",
     cursor: "pointer",
     fontSize: 13,
   },
@@ -896,16 +895,16 @@ const S = {
     color: "#fca5a5",
     border: "none",
     borderRadius: 6,
-    padding: "9px 18px",
+    padding: "8px 14px",
     cursor: "pointer",
     fontSize: 13,
   },
   btnSmall: {
-    background: "#065f46",
+    background: "#064e3b",
     color: "#6ee7b7",
     border: "none",
     borderRadius: 5,
-    padding: "5px 12px",
+    padding: "5px 10px",
     cursor: "pointer",
     fontSize: 12,
     whiteSpace: "nowrap",
@@ -913,53 +912,47 @@ const S = {
   btnGhostSm: {
     background: "none",
     color: "#6b7280",
-    border: "1px solid #374151",
+    border: "1px solid #1f2937",
     borderRadius: 5,
-    padding: "5px 12px",
+    padding: "5px 10px",
     cursor: "pointer",
     fontSize: 12,
   },
   progressBar: {
-    height: 6,
-    background: "#1f2937",
+    height: 5,
+    background: "#1a2235",
     borderRadius: 9,
     overflow: "hidden",
   },
   progressFill: {
     height: "100%",
-    background: "linear-gradient(90deg, #1d4ed8, #3b82f6)",
-    transition: "width 0.3s ease",
+    background: "linear-gradient(90deg,#1d4ed8,#60a5fa)",
+    transition: "width 0.25s ease",
     borderRadius: 9,
   },
   table: { width: "100%", borderCollapse: "collapse" },
   th: {
     padding: "8px 12px",
     textAlign: "left",
-    fontSize: 11,
-    color: "#4b5563",
-    borderBottom: "1px solid #1f2937",
-    letterSpacing: "0.05em",
+    fontSize: 10,
+    color: "#374151",
+    borderBottom: "1px solid #1a2235",
+    letterSpacing: "0.06em",
     textTransform: "uppercase",
+    whiteSpace: "nowrap",
   },
   td: {
-    padding: "8px 12px",
+    padding: "7px 12px",
     fontSize: 12,
-    color: "#d1d5db",
+    color: "#9ca3af",
     verticalAlign: "top",
   },
-  newCatRow: {
-    display: "flex",
-    alignItems: "flex-start",
-    gap: 12,
-    padding: "12px 0",
-    borderBottom: "1px solid #1f2937",
-  },
   stat: { display: "flex", flexDirection: "column", alignItems: "center" },
-  statNum: { fontSize: 36, fontWeight: 700 },
-  statLabel: { fontSize: 12, color: "#6b7280" },
+  statNum: { fontSize: 40, fontWeight: 700, lineHeight: 1 },
+  statLabel: { fontSize: 11, color: "#4b5563", marginTop: 4 },
   idBox: {
-    background: "#111827",
-    border: "1px solid #1f2937",
+    background: "#0d1526",
+    border: "1px solid #1a2235",
     borderRadius: 6,
     padding: 12,
     fontSize: 12,
