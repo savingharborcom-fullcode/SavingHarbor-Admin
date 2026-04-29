@@ -20,6 +20,12 @@ const STATUS = {
   error: { label: "Error", color: "#f97316" },
 };
 
+const STATUS_FILTERS = [
+  { value: "unprocessed", label: "Unprocessed" },
+  { value: "failed", label: "Failed only" },
+  { value: "all", label: "All" },
+];
+
 export default function App() {
   const [tab, setTab] = useState("Classifier");
 
@@ -31,6 +37,7 @@ export default function App() {
   const [filter, setFilter] = useState({
     onlyActive: false,
     onlyPublished: false,
+    statusFilter: "unprocessed",
   });
   const [batchSize] = useState(500);
   const [offset, setOffset] = useState(0);
@@ -67,6 +74,7 @@ export default function App() {
       limit: batchSize,
       onlyActive: filter.onlyActive,
       onlyPublished: filter.onlyPublished,
+      statusFilter: filter.statusFilter,
     });
 
     const [catRes, merRes] = await Promise.all([
@@ -92,7 +100,6 @@ export default function App() {
     setProgress({ done: 0, total: merchants.length });
 
     let idx = 0;
-    const concurrency = validKeys.length; // one worker per key
 
     const worker = async (geminiKey) => {
       while (idx < merchants.length) {
@@ -168,15 +175,21 @@ export default function App() {
 
   // ── Commit ───────────────────────────────────────────────────────────────────
   const commitApproved = async () => {
-    const corrections = Object.values(jobs)
-      .filter((j) => j.changed && approved[j.merchant.id])
+    const corrections = mismatches
+      .filter((j) => approved[j.merchant.id])
       .map((j) => ({
         id: j.merchant.id,
         category_id: j.classification.category_id,
         subcategory_id: j.classification.subcategory_id,
       }));
-    if (!corrections.length) return;
-    const res = await post("/merchants/update", { corrections });
+
+    // Rejected = mismatches the user unchecked — still mark completed (reviewed, kept as-is)
+    const rejected = mismatches
+      .filter((j) => !approved[j.merchant.id])
+      .map((j) => j.merchant.id);
+
+    if (!corrections.length && !rejected.length) return;
+    const res = await post("/merchants/update", { corrections, rejected });
     setCommitResult(res);
     setTab("Results");
   };
@@ -197,7 +210,6 @@ export default function App() {
     : 0;
   const mismatches = Object.values(jobs).filter((j) => j.changed);
   const approvedCount = Object.values(approved).filter(Boolean).length;
-
   const statusCounts = Object.values(jobs).reduce((acc, j) => {
     acc[j.status] = (acc[j.status] || 0) + 1;
     return acc;
@@ -299,8 +311,16 @@ export default function App() {
 
             {/* Filters + Load */}
             <div style={S.card}>
-              <h2 style={S.cardTitle}>Batch</h2>
-              <div style={{ display: "flex", gap: 24, marginBottom: 16 }}>
+              <h2 style={{ ...S.cardTitle, marginBottom: 14 }}>Batch</h2>
+              <div
+                style={{
+                  display: "flex",
+                  gap: 24,
+                  marginBottom: 16,
+                  flexWrap: "wrap",
+                  alignItems: "center",
+                }}
+              >
                 {[
                   ["onlyActive", "Active only"],
                   ["onlyPublished", "Published only"],
@@ -324,6 +344,28 @@ export default function App() {
                     {label}
                   </label>
                 ))}
+                <div style={{ display: "flex", gap: 4 }}>
+                  {STATUS_FILTERS.map((sf) => (
+                    <button
+                      key={sf.value}
+                      onClick={() =>
+                        setFilter((f) => ({ ...f, statusFilter: sf.value }))
+                      }
+                      style={{
+                        ...S.btnGhostSm,
+                        ...(filter.statusFilter === sf.value
+                          ? {
+                              background: "#1d4ed8",
+                              color: "#fff",
+                              borderColor: "#1d4ed8",
+                            }
+                          : {}),
+                      }}
+                    >
+                      {sf.label}
+                    </button>
+                  ))}
+                </div>
               </div>
               <div
                 style={{
@@ -334,7 +376,7 @@ export default function App() {
                 }}
               >
                 <button style={S.btn} onClick={() => loadBatch(0)}>
-                  Load First {batchSize}
+                  Load {batchSize}
                 </button>
                 {offset > 0 && (
                   <button
@@ -355,6 +397,15 @@ export default function App() {
                 {merchants.length > 0 && (
                   <span style={{ color: "#6b7280", fontSize: 12 }}>
                     {offset + 1}–{offset + merchants.length} of {totalMerchants}
+                    <span style={{ marginLeft: 8, color: "#374151" }}>
+                      [
+                      {filter.statusFilter === "unprocessed"
+                        ? "Unprocessed"
+                        : filter.statusFilter === "failed"
+                          ? "Failed"
+                          : "All"}
+                      ]
+                    </span>
                   </span>
                 )}
               </div>
@@ -442,7 +493,7 @@ export default function App() {
                       style={{
                         position: "sticky",
                         top: 0,
-                        background: "#0d1117",
+                        background: "#0b1220",
                         zIndex: 1,
                       }}
                     >
@@ -610,9 +661,10 @@ export default function App() {
                   <button
                     style={{ ...S.btn, marginLeft: 4 }}
                     onClick={commitApproved}
-                    disabled={!approvedCount}
+                    disabled={!mismatches.length}
                   >
-                    Commit {approvedCount}
+                    Commit ({approvedCount} approved ·{" "}
+                    {mismatches.length - approvedCount} rejected)
                   </button>
                 </div>
               </div>
@@ -628,7 +680,7 @@ export default function App() {
                       style={{
                         position: "sticky",
                         top: 0,
-                        background: "#0d1117",
+                        background: "#0b1220",
                         zIndex: 1,
                       }}
                     >
@@ -735,9 +787,9 @@ export default function App() {
                     <h3
                       style={{
                         color: "#10b981",
-                        fontSize: 12,
+                        fontSize: 11,
                         marginBottom: 8,
-                        letterSpacing: "0.05em",
+                        letterSpacing: "0.08em",
                         textTransform: "uppercase",
                       }}
                     >
@@ -762,10 +814,10 @@ export default function App() {
                     <h3
                       style={{
                         color: "#ef4444",
-                        fontSize: 12,
+                        fontSize: 11,
                         marginTop: 20,
                         marginBottom: 8,
-                        letterSpacing: "0.05em",
+                        letterSpacing: "0.08em",
                         textTransform: "uppercase",
                       }}
                     >
@@ -851,7 +903,6 @@ const S = {
     letterSpacing: "0.08em",
     textTransform: "uppercase",
     margin: 0,
-    marginBottom: 0,
   },
   keyTag: { fontSize: 11, color: "#4b5563", minWidth: 40 },
   label: {

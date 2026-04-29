@@ -16,7 +16,7 @@ const router = Router();
 async function scrapeStore(url) {
   try {
     const { data } = await axios.get(url, {
-      timeout: 12000,
+      timeout: 8000,
       headers: {
         "User-Agent": "Mozilla/5.0 (compatible; CategoryBot/1.0)",
         Accept: "text/html,application/xhtml+xml",
@@ -28,15 +28,27 @@ async function scrapeStore(url) {
       title: $("title").text().trim().slice(0, 200),
       metaDesc:
         $('meta[name="description"]').attr("content")?.trim().slice(0, 500) ||
-        $('meta[property="og:description"]').attr("content")?.trim().slice(0, 500) ||
+        $('meta[property="og:description"]')
+          .attr("content")
+          ?.trim()
+          .slice(0, 500) ||
         "",
-      ogTitle: $('meta[property="og:title"]').attr("content")?.trim().slice(0, 200) || "",
+      ogTitle:
+        $('meta[property="og:title"]').attr("content")?.trim().slice(0, 200) ||
+        "",
       h1: $("h1").first().text().trim().slice(0, 200),
       bodyText: $("body").text().replace(/\s+/g, " ").trim().slice(0, 1000),
       error: null,
     };
   } catch (e) {
-    return { title: "", metaDesc: "", ogTitle: "", h1: "", bodyText: "", error: e.message };
+    return {
+      title: "",
+      metaDesc: "",
+      ogTitle: "",
+      h1: "",
+      bodyText: "",
+      error: e.message,
+    };
   }
 }
 
@@ -49,16 +61,23 @@ async function withRetry(fn, { retries = 4, baseDelay = 2000 } = {}) {
       const status = e.response?.status;
       const retryable = status === 429 || status === 503 || status === 500;
       if (!retryable || attempt === retries) throw e;
-      // honour Retry-After header if present, else exponential backoff
       const retryAfter = e.response?.headers?.["retry-after"];
-      const delay = retryAfter ? parseInt(retryAfter) * 1000 : baseDelay * 2 ** attempt;
+      const delay = retryAfter
+        ? parseInt(retryAfter) * 1000
+        : baseDelay * 2 ** attempt;
       await new Promise((r) => setTimeout(r, delay));
     }
   }
 }
 
 // ─── Gemini Classifier ────────────────────────────────────────────────────────
-async function classifyWithGemini({ apiKey, model, store, categories, scraped }) {
+async function classifyWithGemini({
+  apiKey,
+  model,
+  store,
+  categories,
+  scraped,
+}) {
   const categoryList = categories
     .map((c) => {
       if (c.parent_id) return null;
@@ -115,8 +134,8 @@ Respond ONLY with valid JSON, no markdown:
         contents: [{ parts: [{ text: prompt }] }],
         generationConfig: { temperature: 0.1, maxOutputTokens: 512 },
       },
-      { timeout: 30000 }
-    )
+      { timeout: 45000 },
+    ),
   );
 
   const raw = res.data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
@@ -140,19 +159,41 @@ router.get("/merchants/batch", async (req, res) => {
   const limit = parseInt(req.query.limit) || 500;
   const onlyActive = req.query.onlyActive === "true";
   const onlyPublished = req.query.onlyPublished === "true";
+  const statusFilter = req.query.statusFilter || "unprocessed"; // unprocessed | failed | all
 
   let query = supabase
     .from("merchants")
-    .select("id, name, web_url, aff_url, category_id, subcategory_id", { count: "exact" })
+    .select(
+      "id, name, web_url, aff_url, category_id, subcategory_id, classifier_status",
+      { count: "exact" },
+    )
     .order("id")
     .range(offset, offset + limit - 1);
 
   if (onlyActive) query = query.eq("active", true);
   if (onlyPublished) query = query.eq("is_publish", true);
 
+  if (statusFilter === "unprocessed")
+    query = query.is("classifier_status", null);
+  else if (statusFilter === "failed")
+    query = query.eq("classifier_status", "failed");
+  // "all" — no filter
+
   const { data, error, count } = await query;
   if (error) return res.status(500).json({ error: error.message });
   res.json({ merchants: data, total: count });
+});
+
+// Mark a single merchant failed immediately (called by frontend on classify error)
+router.post("/merchants/mark-failed", async (req, res) => {
+  const { id } = req.body;
+  const { error } = await supabase
+    .from("merchants")
+    .update({ classifier_status: "failed" })
+    .eq("id", id);
+
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ ok: true });
 });
 
 router.post("/classify", async (req, res) => {
@@ -161,7 +202,14 @@ router.post("/classify", async (req, res) => {
     const url = merchant.web_url || merchant.aff_url;
     const scraped = url
       ? await scrapeStore(url)
-      : { title: merchant.name, metaDesc: "", ogTitle: "", h1: "", bodyText: "", error: "no URL" };
+      : {
+          title: merchant.name,
+          metaDesc: "",
+          ogTitle: "",
+          h1: "",
+          bodyText: "",
+          error: "no URL",
+        };
 
     const classification = await classifyWithGemini({
       apiKey: geminiKey || process.env.GEMINI_API_KEY,
@@ -171,14 +219,26 @@ router.post("/classify", async (req, res) => {
       scraped,
     });
 
-    res.json({
-      classification,
-      scraped: { error: scraped.error },
-      changed:
-        classification.category_id !== merchant.category_id ||
-        classification.subcategory_id !== merchant.subcategory_id,
-    });
+    const changed =
+      classification.category_id !== merchant.category_id ||
+      classification.subcategory_id !== merchant.subcategory_id;
+
+    // If no change needed — mark completed immediately, no review required
+    if (!changed) {
+      await supabase
+        .from("merchants")
+        .update({ classifier_status: "completed" })
+        .eq("id", merchant.id);
+    }
+
+    res.json({ classification, scraped: { error: scraped.error }, changed });
   } catch (e) {
+    // Mark failed in DB so it surfaces on next "failed" batch load
+    await supabase
+      .from("merchants")
+      .update({ classifier_status: "failed" })
+      .eq("id", merchant.id);
+
     res.status(500).json({ error: e.message });
   }
 });
@@ -201,21 +261,36 @@ router.post("/categories/create", async (req, res) => {
   res.json({ category: data });
 });
 
+// Commit approved corrections — marks completed, rejects stay as-is for manual review
 router.post("/merchants/update", async (req, res) => {
-  const { corrections } = req.body;
-  const updated = [], failed = [];
+  const { corrections, rejected } = req.body;
+  // corrections: [{ id, category_id, subcategory_id }]
+  // rejected: [id] — mismatches the user did not approve; mark completed since they were reviewed
+  const updated = [],
+    failed = [];
 
-  await Promise.all(
-    corrections.map(async (c) => {
+  await Promise.all([
+    ...corrections.map(async (c) => {
       const { error } = await supabase
         .from("merchants")
-        .update({ category_id: c.category_id, subcategory_id: c.subcategory_id })
+        .update({
+          category_id: c.category_id,
+          subcategory_id: c.subcategory_id,
+          classifier_status: "completed",
+        })
         .eq("id", c.id);
 
       if (error) failed.push({ id: c.id, error: error.message });
       else updated.push(c.id);
-    })
-  );
+    }),
+    // Mark rejected mismatches as completed too — they were reviewed, just kept as-is
+    ...(rejected || []).map((id) =>
+      supabase
+        .from("merchants")
+        .update({ classifier_status: "completed" })
+        .eq("id", id),
+    ),
+  ]);
 
   res.json({ updated, failed });
 });
