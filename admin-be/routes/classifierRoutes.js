@@ -1,38 +1,16 @@
 /**
  * Merchant Category Classifier — Express Router
- * Mount in your app: app.use('/api/classifier', require('./routes/classifier'))
+ * Mount: app.use('/api/classifier', classifierRouter)
  *
- * Required env (or pass via request body for DB):
- *   GEMINI_API_KEY — optional fallback if not sent from UI
+ * Dependencies: npm install axios cheerio
  */
 
 import { Router } from "express";
-import pg from "pg";
 import axios from "axios";
 import * as cheerio from "cheerio";
+import { supabase } from "../dbhelper/dbclient.js";
 
 const router = Router();
-
-// ─── DB Pool Cache ────────────────────────────────────────────────────────────
-const pools = {};
-
-function getPool(cfg) {
-  const key = `${cfg.host}:${cfg.port || 5432}:${cfg.database}:${cfg.user}`;
-  if (!pools[key]) {
-    pools[key] = new pg.Pool({
-      host: cfg.host,
-      port: cfg.port || 5432,
-      database: cfg.database,
-      user: cfg.user,
-      password: cfg.password,
-      ssl: cfg.ssl ? { rejectUnauthorized: false } : false,
-      max: 10,
-      idleTimeoutMillis: 30000,
-      connectionTimeoutMillis: 5000,
-    });
-  }
-  return pools[key];
-}
 
 // ─── Scraper ──────────────────────────────────────────────────────────────────
 async function scrapeStore(url) {
@@ -50,20 +28,38 @@ async function scrapeStore(url) {
       title: $("title").text().trim().slice(0, 200),
       metaDesc:
         $('meta[name="description"]').attr("content")?.trim().slice(0, 500) ||
-        $('meta[property="og:description"]').attr("content")?.trim().slice(0, 500) ||
+        $('meta[property="og:description"]')
+          .attr("content")
+          ?.trim()
+          .slice(0, 500) ||
         "",
-      ogTitle: $('meta[property="og:title"]').attr("content")?.trim().slice(0, 200) || "",
+      ogTitle:
+        $('meta[property="og:title"]').attr("content")?.trim().slice(0, 200) ||
+        "",
       h1: $("h1").first().text().trim().slice(0, 200),
       bodyText: $("body").text().replace(/\s+/g, " ").trim().slice(0, 1000),
       error: null,
     };
   } catch (e) {
-    return { title: "", metaDesc: "", ogTitle: "", h1: "", bodyText: "", error: e.message };
+    return {
+      title: "",
+      metaDesc: "",
+      ogTitle: "",
+      h1: "",
+      bodyText: "",
+      error: e.message,
+    };
   }
 }
 
 // ─── Gemini Classifier ────────────────────────────────────────────────────────
-async function classifyWithGemini({ apiKey, model, store, categories, scraped }) {
+async function classifyWithGemini({
+  apiKey,
+  model,
+  store,
+  categories,
+  scraped,
+}) {
   const categoryList = categories
     .map((c) => {
       if (c.parent_id) return null;
@@ -92,7 +88,7 @@ SCRAPED DATA:
 - Body snippet: ${scraped.bodyText.slice(0, 600)}
 ${scraped.error ? `- Scrape error: ${scraped.error}` : ""}
 
-CATEGORY TAXONOMY ([id] Category / [id] Subcategory):
+CATEGORY TAXONOMY ([id] Category\n    - [id] Subcategory):
 ${categoryList}
 
 TASK:
@@ -119,7 +115,7 @@ Respond ONLY with valid JSON, no markdown:
       contents: [{ parts: [{ text: prompt }] }],
       generationConfig: { temperature: 0.1, maxOutputTokens: 512 },
     },
-    { timeout: 30000 }
+    { timeout: 30000 },
   );
 
   const raw = res.data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
@@ -128,58 +124,52 @@ Respond ONLY with valid JSON, no markdown:
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
 
-router.post("/test-connection", async (req, res) => {
-  try {
-    const client = await getPool(req.body).connect();
-    await client.query("SELECT 1");
-    client.release();
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(400).json({ ok: false, error: e.message });
-  }
+router.get("/categories", async (req, res) => {
+  const { data, error } = await supabase
+    .from("merchant_categories_v2")
+    .select("id, name, slug, parent_id")
+    .order("parent_id", { ascending: true, nullsFirst: true });
+
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ categories: data });
 });
 
-router.post("/categories", async (req, res) => {
-  try {
-    const { rows } = await getPool(req.body.db).query(
-      "SELECT id, name, slug, parent_id FROM merchant_categories_v2 ORDER BY parent_id NULLS FIRST, id"
-    );
-    res.json({ categories: rows });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
+router.get("/merchants/batch", async (req, res) => {
+  const offset = parseInt(req.query.offset) || 0;
+  const limit = parseInt(req.query.limit) || 500;
+  const onlyActive = req.query.onlyActive === "true";
+  const onlyPublished = req.query.onlyPublished === "true";
 
-router.post("/merchants/batch", async (req, res) => {
-  const { db, offset = 0, limit = 500, filter = {} } = req.body;
-  try {
-    const conditions = [];
-    if (filter.onlyActive) conditions.push("active = true");
-    if (filter.onlyPublished) conditions.push("is_publish = true");
-    const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
+  let query = supabase
+    .from("merchants")
+    .select("id, name, web_url, aff_url, category_id, subcategory_id", {
+      count: "exact",
+    })
+    .order("id")
+    .range(offset, offset + limit - 1);
 
-    const [{ rows: merchants }, { rows: count }] = await Promise.all([
-      getPool(db).query(
-        `SELECT id, name, web_url, aff_url, category_id, subcategory_id
-         FROM merchants ${where} ORDER BY id LIMIT $1 OFFSET $2`,
-        [limit, offset]
-      ),
-      getPool(db).query(`SELECT COUNT(*) as total FROM merchants ${where}`),
-    ]);
+  if (onlyActive) query = query.eq("active", true);
+  if (onlyPublished) query = query.eq("is_publish", true);
 
-    res.json({ merchants, total: parseInt(count[0].total) });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+  const { data, error, count } = await query;
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ merchants: data, total: count });
 });
 
 router.post("/classify", async (req, res) => {
-  const { db, geminiKey, model, merchant, categories } = req.body;
+  const { geminiKey, model, merchant, categories } = req.body;
   try {
     const url = merchant.web_url || merchant.aff_url;
     const scraped = url
       ? await scrapeStore(url)
-      : { title: merchant.name, metaDesc: "", ogTitle: "", h1: "", bodyText: "", error: "no URL" };
+      : {
+          title: merchant.name,
+          metaDesc: "",
+          ogTitle: "",
+          h1: "",
+          bodyText: "",
+          error: "no URL",
+        };
 
     const classification = await classifyWithGemini({
       apiKey: geminiKey || process.env.GEMINI_API_KEY,
@@ -202,44 +192,44 @@ router.post("/classify", async (req, res) => {
 });
 
 router.post("/categories/create", async (req, res) => {
-  const { db, category } = req.body;
-  try {
-    const { rows } = await getPool(db).query(
-      `INSERT INTO merchant_categories_v2 (name, slug, description, parent_id, is_publish)
-       VALUES ($1, $2, $3, $4, false) RETURNING id, name, slug, parent_id`,
-      [category.name, category.slug, category.description || null, category.parent_id || null]
-    );
-    res.json({ category: rows[0] });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+  const { category } = req.body;
+  const { data, error } = await supabase
+    .from("merchant_categories_v2")
+    .insert({
+      name: category.name,
+      slug: category.slug,
+      description: category.description || null,
+      parent_id: category.parent_id || null,
+      is_publish: false,
+    })
+    .select("id, name, slug, parent_id")
+    .single();
+
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ category: data });
 });
 
 router.post("/merchants/update", async (req, res) => {
-  const { db, corrections } = req.body;
-  const client = await getPool(db).connect();
-  const updated = [], failed = [];
-  try {
-    await client.query("BEGIN");
-    for (const c of corrections) {
-      try {
-        await client.query(
-          `UPDATE merchants SET category_id = $1, subcategory_id = $2, updated_at = NOW() WHERE id = $3`,
-          [c.category_id, c.subcategory_id, c.id]
-        );
-        updated.push(c.id);
-      } catch (e) {
-        failed.push({ id: c.id, error: e.message });
-      }
-    }
-    await client.query("COMMIT");
-    res.json({ updated, failed });
-  } catch (e) {
-    await client.query("ROLLBACK");
-    res.status(500).json({ error: e.message });
-  } finally {
-    client.release();
-  }
+  const { corrections } = req.body;
+  const updated = [],
+    failed = [];
+
+  await Promise.all(
+    corrections.map(async (c) => {
+      const { error } = await supabase
+        .from("merchants")
+        .update({
+          category_id: c.category_id,
+          subcategory_id: c.subcategory_id,
+        })
+        .eq("id", c.id);
+
+      if (error) failed.push({ id: c.id, error: error.message });
+      else updated.push(c.id);
+    }),
+  );
+
+  res.json({ updated, failed });
 });
 
 export default router;
