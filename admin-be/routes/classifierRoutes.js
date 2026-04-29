@@ -28,38 +28,37 @@ async function scrapeStore(url) {
       title: $("title").text().trim().slice(0, 200),
       metaDesc:
         $('meta[name="description"]').attr("content")?.trim().slice(0, 500) ||
-        $('meta[property="og:description"]')
-          .attr("content")
-          ?.trim()
-          .slice(0, 500) ||
+        $('meta[property="og:description"]').attr("content")?.trim().slice(0, 500) ||
         "",
-      ogTitle:
-        $('meta[property="og:title"]').attr("content")?.trim().slice(0, 200) ||
-        "",
+      ogTitle: $('meta[property="og:title"]').attr("content")?.trim().slice(0, 200) || "",
       h1: $("h1").first().text().trim().slice(0, 200),
       bodyText: $("body").text().replace(/\s+/g, " ").trim().slice(0, 1000),
       error: null,
     };
   } catch (e) {
-    return {
-      title: "",
-      metaDesc: "",
-      ogTitle: "",
-      h1: "",
-      bodyText: "",
-      error: e.message,
-    };
+    return { title: "", metaDesc: "", ogTitle: "", h1: "", bodyText: "", error: e.message };
+  }
+}
+
+// ─── Retry helper ─────────────────────────────────────────────────────────────
+async function withRetry(fn, { retries = 4, baseDelay = 2000 } = {}) {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      return await fn();
+    } catch (e) {
+      const status = e.response?.status;
+      const retryable = status === 429 || status === 503 || status === 500;
+      if (!retryable || attempt === retries) throw e;
+      // honour Retry-After header if present, else exponential backoff
+      const retryAfter = e.response?.headers?.["retry-after"];
+      const delay = retryAfter ? parseInt(retryAfter) * 1000 : baseDelay * 2 ** attempt;
+      await new Promise((r) => setTimeout(r, delay));
+    }
   }
 }
 
 // ─── Gemini Classifier ────────────────────────────────────────────────────────
-async function classifyWithGemini({
-  apiKey,
-  model,
-  store,
-  categories,
-  scraped,
-}) {
+async function classifyWithGemini({ apiKey, model, store, categories, scraped }) {
   const categoryList = categories
     .map((c) => {
       if (c.parent_id) return null;
@@ -109,13 +108,15 @@ Respond ONLY with valid JSON, no markdown:
   "reasoning": "<one sentence>"
 }`;
 
-  const res = await axios.post(
-    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
-    {
-      contents: [{ parts: [{ text: prompt }] }],
-      generationConfig: { temperature: 0.1, maxOutputTokens: 512 },
-    },
-    { timeout: 30000 },
+  const res = await withRetry(() =>
+    axios.post(
+      `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
+      {
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: { temperature: 0.1, maxOutputTokens: 512 },
+      },
+      { timeout: 30000 }
+    )
   );
 
   const raw = res.data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
@@ -142,9 +143,7 @@ router.get("/merchants/batch", async (req, res) => {
 
   let query = supabase
     .from("merchants")
-    .select("id, name, web_url, aff_url, category_id, subcategory_id", {
-      count: "exact",
-    })
+    .select("id, name, web_url, aff_url, category_id, subcategory_id", { count: "exact" })
     .order("id")
     .range(offset, offset + limit - 1);
 
@@ -162,14 +161,7 @@ router.post("/classify", async (req, res) => {
     const url = merchant.web_url || merchant.aff_url;
     const scraped = url
       ? await scrapeStore(url)
-      : {
-          title: merchant.name,
-          metaDesc: "",
-          ogTitle: "",
-          h1: "",
-          bodyText: "",
-          error: "no URL",
-        };
+      : { title: merchant.name, metaDesc: "", ogTitle: "", h1: "", bodyText: "", error: "no URL" };
 
     const classification = await classifyWithGemini({
       apiKey: geminiKey || process.env.GEMINI_API_KEY,
@@ -211,22 +203,18 @@ router.post("/categories/create", async (req, res) => {
 
 router.post("/merchants/update", async (req, res) => {
   const { corrections } = req.body;
-  const updated = [],
-    failed = [];
+  const updated = [], failed = [];
 
   await Promise.all(
     corrections.map(async (c) => {
       const { error } = await supabase
         .from("merchants")
-        .update({
-          category_id: c.category_id,
-          subcategory_id: c.subcategory_id,
-        })
+        .update({ category_id: c.category_id, subcategory_id: c.subcategory_id })
         .eq("id", c.id);
 
       if (error) failed.push({ id: c.id, error: error.message });
       else updated.push(c.id);
-    }),
+    })
   );
 
   res.json({ updated, failed });
