@@ -15,6 +15,7 @@ import merchantCategoryRoutes from "./routes/merchantCategoryRoutes.js";
 import importRoutes from "./routes/importRoutes.js";
 import dashboardRoutes from "./routes/dashboardRoutes.js";
 import seoRoutes from "./routes/seoRoutes.js";
+import classifierRoutes from "./routes/classifierRoutes.js";
 import { supabase } from "./dbhelper/dbclient.js";
 
 dotenv.config();
@@ -71,6 +72,7 @@ app.use("/api/merchant-categories", merchantCategoryRoutes);
 app.use("/api/imports", importRoutes);
 app.use("/api/dashboard", dashboardRoutes);
 app.use("/api/seo", seoRoutes);
+app.use("/api/classifier", classifierRoutes);
 
 app.get("/", (req, res) => {
   res.json({ message: "Welcome to Handpicked Backend API" });
