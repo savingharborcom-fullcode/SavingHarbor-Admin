@@ -15,15 +15,39 @@ const router = Router();
 // ─── Scraper ──────────────────────────────────────────────────────────────────
 async function scrapeStore(url) {
   try {
-    const { data } = await axios.get(url, {
+    const response = await axios.get(url, {
       timeout: 8000,
+      responseType: "stream",
       headers: {
         "User-Agent": "Mozilla/5.0 (compatible; CategoryBot/1.0)",
         Accept: "text/html,application/xhtml+xml",
       },
       maxRedirects: 5,
     });
-    const $ = cheerio.load(data);
+
+    // Collect stream until 10KB or end — whichever comes first
+    const chunk = await new Promise((resolve, reject) => {
+      const buffers = [];
+      let total = 0;
+      const LIMIT = 10240; // 10KB
+
+      response.data.on("data", (buf) => {
+        const remaining = LIMIT - total;
+        if (remaining <= 0) return;
+        buffers.push(buf.slice(0, remaining));
+        total += Math.min(buf.length, remaining);
+        if (total >= LIMIT) response.data.destroy(); // stop download
+      });
+      response.data.on("end", () =>
+        resolve(Buffer.concat(buffers).toString("utf8")),
+      );
+      response.data.on("close", () =>
+        resolve(Buffer.concat(buffers).toString("utf8")),
+      );
+      response.data.on("error", reject);
+    });
+
+    const $ = cheerio.load(chunk);
     return {
       title: $("title").text().trim().slice(0, 200),
       metaDesc:
@@ -51,7 +75,6 @@ async function scrapeStore(url) {
     };
   }
 }
-
 // ─── Retry helper ─────────────────────────────────────────────────────────────
 async function withRetry(fn, { retries = 4, baseDelay = 2000 } = {}) {
   for (let attempt = 0; attempt <= retries; attempt++) {
