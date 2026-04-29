@@ -131,12 +131,12 @@ export default function App() {
       while (idx < merchants.length) {
         if (abortRef.current) break;
         const merchant = merchants[idx++];
+        await acquireToken();
 
         setJobs((j) => ({
           ...j,
           [merchant.id]: { status: "scraping", merchant },
         }));
-        await acquireToken();
         try {
           const res = await post("/classify", {
             geminiKey,
